@@ -17,6 +17,7 @@ import json
 import jsonschema
 from jsonschema.exceptions import ValidationError
 
+from src.mcp.client_mcp_manager import tool_permitted as _mcp_tool_permitted
 from src.platform.pod_dev_tools import POD_ROUTABLE_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -602,7 +603,10 @@ class ToolExecutor:
                         return result
                     return {"success": True, "result": result}
                 except Exception as e:
-                    logger.error("Custom tool %s failed: %s", tool_name, e)
+                    # Log with full traceback so the agent-call / A2A failure
+                    # mode "NoneType object has no attribute 'get'" is
+                    # debuggable from worker logs without code changes.
+                    logger.exception("Custom tool %s failed: %s", tool_name, e)
                     return {"success": False, "error": str(e)}
 
             # MCP tools: mcp__<server>__<tool> — with timeout
@@ -730,40 +734,94 @@ class ToolExecutor:
                     chunks.append(str(c))
             return (not is_error, "\n".join(chunks))
 
-        # Try client-specific MCP server first. The agent's namespace scopes
-        # credential resolution (namespace creds preferred, else user creds).
-        client_id = (agent_context or {}).get("client_id")
-        namespace = (agent_context or {}).get("namespace") or "default"
-        if client_id and self._client_mcp_manager:
+        # Try client-specific MCP servers first, walking the agent's scope chain
+        # (narrowest-first: user -> namespace -> platform). The first scope that
+        # actually has this server wins — matching the narrowest-wins dedupe used
+        # to advertise the tool in append_client_mcp_tools. For a ``ns:<name>``
+        # scope the credential namespace is that name; otherwise the agent's own.
+        agent_namespace = (agent_context or {}).get("namespace") or "default"
+        chain = (agent_context or {}).get("mcp_scope_chain")
+        if not chain:
+            _cid = (agent_context or {}).get("client_id")
+            chain = [_cid] if _cid else []
+        # Access-group enforcement (execute funnel): if the agent is bound to an
+        # MCP access group, a server outside it is off-limits even if named
+        # directly — symmetric with the advertising filter in
+        # append_client_mcp_tools.
+        _group = (agent_context or {}).get("mcp_access_group")
+        if _group and self._client_mcp_manager:
             try:
-                client_session = await self._client_mcp_manager.get_client(
-                    client_id, server_name, namespace,
+                allowed_servers = self._client_mcp_manager.resolve_access_group(_group)
+            except Exception:
+                allowed_servers = None
+            if allowed_servers is not None and server_name not in allowed_servers:
+                return {
+                    "success": False,
+                    "error": (
+                        f"MCP server '{server_name}' is not in this agent's "
+                        f"access group '{_group}'"
+                    ),
+                }
+        if chain and self._client_mcp_manager:
+            for client_id in chain:
+                if not client_id:
+                    continue
+                ns_for_call = (
+                    client_id.split("ns:", 1)[1]
+                    if client_id.startswith("ns:")
+                    else agent_namespace
                 )
-                if client_session:
-                    # Per-user MCP servers connect lazily and never went through
-                    # ``register_mcp_tools`` at boot, so ``_get_tool_schema`` was
-                    # missing their schemas — logging a warning on every call and
-                    # skipping local input validation. Populate the cache once,
-                    # from the schemas discovered at connect, so subsequent calls
-                    # validate locally and stay quiet.
-                    if server_name not in self._mcp_tool_definitions:
-                        try:
-                            schemas = await self._client_mcp_manager.get_tool_schemas(
-                                client_id, server_name, namespace,
-                            )
-                            if schemas:
-                                self.register_mcp_tools(server_name, schemas)
-                        except Exception:
-                            logger.debug(
-                                "could not cache schemas for %s/%s",
-                                client_id, server_name, exc_info=True,
-                            )
+                try:
+                    client_session = await self._client_mcp_manager.get_client(
+                        client_id, server_name, ns_for_call,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Client MCP %s/%s tool %s failed: %s",
+                        client_id, server_name, method_name, e,
+                    )
+                    return {"success": False, "error": str(e)}
+                if not client_session:
+                    continue  # this scope doesn't have the server — try broader
+                # Per-server allow/deny enforcement (the execute funnel — the
+                # advertising funnel in get_all_client_tools is bypassable since
+                # an LLM can name an unadvertised tool directly).
+                cfg = self._client_mcp_manager._load_server_config(
+                    client_id, server_name,
+                )
+                if not _mcp_tool_permitted(method_name, cfg):
+                    return {
+                        "success": False,
+                        "error": (
+                            f"tool '{method_name}' is not permitted for MCP "
+                            f"server '{server_name}'"
+                        ),
+                    }
+                # Per-client MCP servers connect lazily and never went through
+                # ``register_mcp_tools`` at boot, so populate the schema cache
+                # once so subsequent calls validate locally and stay quiet.
+                if server_name not in self._mcp_tool_definitions:
+                    try:
+                        schemas = await self._client_mcp_manager.get_tool_schemas(
+                            client_id, server_name, ns_for_call,
+                        )
+                        if schemas:
+                            self.register_mcp_tools(server_name, schemas)
+                    except Exception:
+                        logger.debug(
+                            "could not cache schemas for %s/%s",
+                            client_id, server_name, exc_info=True,
+                        )
+                try:
                     result = await client_session.call_tool(method_name, tool_input)
-                    ok, body = _flatten(result)
-                    return {"success": ok, "result": body}
-            except Exception as e:
-                logger.error("Client MCP %s/%s tool %s failed: %s", client_id, server_name, method_name, e)
-                return {"success": False, "error": str(e)}
+                except Exception as e:
+                    logger.error(
+                        "Client MCP %s/%s tool %s failed: %s",
+                        client_id, server_name, method_name, e,
+                    )
+                    return {"success": False, "error": str(e)}
+                ok, body = _flatten(result)
+                return {"success": ok, "result": body}
 
         # Fallback to company-level MCP client
         client = self._mcp_clients.get(server_name)
@@ -883,6 +941,12 @@ class ToolExecutor:
             # write gate; 120s cut the call off before it could park on approval.
             # Stays under the 300s Cloud Run request timeout.
             timeout=input.get("timeout", 240),
+            # Force inline execution even when the callee has gates declared,
+            # IF the caller knows this specific task won't fire one (e.g. a
+            # read-only mode A lookup). Without this override, gated callees
+            # are auto-dispatched to the worker tier and the caller only gets
+            # a "delegated_running" ack instead of the real output.
+            force_inline=bool(input.get("inline", False)),
         )
 
     async def _handle_a2a_async_call(self, input: dict, ctx: dict | None) -> dict:

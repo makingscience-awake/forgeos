@@ -26,6 +26,75 @@ try:
 except ImportError:
     HAS_MCP = False
 
+# Streamable HTTP is optional in older mcp SDK builds — feature-detect so
+# stdio-only deployments keep working even if the client wheel is thin.
+try:
+    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+    HAS_MCP_HTTP = True
+except ImportError:
+    HAS_MCP_HTTP = False
+
+from src.mcp.launch_utils import materialize_gcp_credentials, resolve_launch_command
+
+
+def _coerce_tool_list(value, *, none_ok: bool = False):
+    """Normalize a JSONB tool-name value to list[str] or None.
+
+    Handles both a psycopg-decoded ``list`` and a raw JSON ``str``. ``none_ok``
+    keeps NULL as None (allow-all for ``allowed_tools``).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            import json as _json
+            value = _json.loads(value)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return None
+
+
+def _coerce_json_obj(value):
+    """Normalize a JSONB object column to a dict (psycopg may hand back str)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            import json as _json
+            value = _json.loads(value)
+        except (ValueError, TypeError):
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def tool_permitted(tool_name: str, cfg: dict | None) -> bool:
+    """Whether a bare upstream ``tool_name`` is allowed by a server's config.
+
+    ``allowed_tools`` None/absent → allow all; otherwise the name must be in it.
+    ``disallowed_tools`` is subtracted afterward. This is the single source of
+    truth for both the advertising funnel (``get_all_client_tools`` →
+    ``filter_tool_schemas``) and the execution funnel
+    (``ToolExecutor._execute_mcp_tool``).
+    """
+    if not cfg:
+        return True
+    allow = cfg.get("allowed_tools")
+    deny = set(cfg.get("disallowed_tools") or [])
+    if tool_name in deny:
+        return False
+    if allow is None:
+        return True
+    return tool_name in set(allow)
+
+
+def filter_tool_schemas(schemas: list[dict], cfg: dict | None) -> list[dict]:
+    """Drop tool schemas not permitted by the server's allow/deny config."""
+    if not cfg or (cfg.get("allowed_tools") is None and not cfg.get("disallowed_tools")):
+        return schemas
+    return [s for s in schemas if tool_permitted(s.get("name", ""), cfg)]
+
 
 @dataclass
 class ClientMCPConnection:
@@ -72,6 +141,9 @@ class ClientMCPManager:
         self._connect_cooldowns: dict[tuple[str, str, str], float] = {}  # key → earliest_retry_time
         self._COOLDOWN_SECONDS = 60.0
         self._secrets_manager = secrets_manager
+        # OAuth2 client-credentials token cache: (client_id, server_name) →
+        # (access_token, expiry_epoch). Refreshed in _apply_auth on expiry.
+        self._oauth_tokens: dict[tuple[str, str], tuple[str, float]] = {}
 
     def register_client_config(self, client_id: str, configs: list[dict]) -> None:
         """Register MCP configs for a client (in-memory, for dev/no-DB mode)."""
@@ -149,16 +221,42 @@ class ClientMCPManager:
         return conn.tool_schemas if conn else []
 
     async def get_all_client_tools(self, client_id: str) -> dict[str, list[dict]]:
-        """Get all tool schemas for all MCP servers configured for a client."""
+        """Get all tool schemas for all MCP servers configured for a client.
+
+        Each server is connected and introspected concurrently, and — critically
+        — in isolation: an exception raised by one server's connect (including
+        anyio's ``RuntimeError: Attempted to exit cancel scope in a different
+        task…`` that leaks out of ``stdio_client``'s cleanup when a subprocess
+        dies at handshake) MUST NOT abort discovery for the other servers or
+        propagate up into the enclosing Celery task. We collect results with
+        ``return_exceptions=True`` and log-and-drop each failure per server.
+        """
         configs = self._load_all_configs(client_id)
-        result: dict[str, list[dict]] = {}
-        for cfg in configs:
-            server_name = cfg.get("server_name", "")
-            if server_name and cfg.get("enabled", True):
-                schemas = await self.get_tool_schemas(client_id, server_name)
-                if schemas:
-                    result[server_name] = schemas
-        return result
+        cfg_by_server = {
+            cfg.get("server_name", ""): cfg
+            for cfg in configs
+            if cfg.get("server_name") and cfg.get("enabled", True)
+        }
+        targets = list(cfg_by_server)
+        if not targets:
+            return {}
+
+        async def _one(name: str) -> tuple[str, list[dict]]:
+            try:
+                schemas = await self.get_tool_schemas(client_id, name)
+                # Apply this server's per-server allow/deny (advertising funnel).
+                return name, filter_tool_schemas(schemas, cfg_by_server.get(name))
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "MCP tool discovery failed for %s/%s: %s (other servers unaffected)",
+                    client_id, name, e,
+                )
+                return name, []
+
+        pairs = await asyncio.gather(
+            *(_one(n) for n in targets), return_exceptions=False,
+        )
+        return {name: schemas for name, schemas in pairs if schemas}
 
     async def disconnect_client(self, client_id: str) -> None:
         """Disconnect all MCP servers for a client."""
@@ -207,6 +305,26 @@ class ClientMCPManager:
                 return cfg
         return None
 
+    def resolve_access_group(self, name: str) -> set[str] | None:
+        """Resolve an MCP access-group name to its set of server_names.
+
+        Returns None when the group is unset or doesn't exist (→ callers treat
+        that as "no restriction", i.e. all in-scope servers). An existing but
+        empty group returns an empty set (→ nothing visible), which is a valid
+        way to fully mask MCPs for an agent. Backed by `mcp_access_groups`
+        (migration 024); tenant-scoped via the manager's own db + tenant_id.
+        """
+        if not name:
+            return None
+        try:
+            from src.platform.client_store import PostgresMcpAccessGroupStore
+            store = PostgresMcpAccessGroupStore(self._db, tenant_id=self._tenant_id)
+            names = store.get(name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("resolve_access_group(%s) failed: %s", name, e)
+            return None
+        return set(names) if names is not None else None
+
     def _load_all_configs(self, client_id: str) -> list[dict]:
         """Load all MCP configs for a client from DB or in-memory cache."""
         # In-memory cache (dev mode)
@@ -219,7 +337,9 @@ class ClientMCPManager:
             try:
                 with self._db.tenant(self._tenant_id) as conn:
                     rows = conn.execute(
-                        "SELECT server_name, package, env_vars, args, enabled "
+                        "SELECT server_name, package, env_vars, args, enabled, "
+                        "transport, url, allowed_tools, disallowed_tools, "
+                        "auth_type, auth_config "
                         "FROM client_mcp_configs WHERE client_id = %s AND enabled = true",
                         (client_id,),
                     )
@@ -230,6 +350,12 @@ class ClientMCPManager:
                         "env_vars": r.get("env_vars", {}),
                         "args": r.get("args", []),
                         "enabled": r.get("enabled", True),
+                        "transport": r.get("transport") or "stdio",
+                        "url": r.get("url"),
+                        "allowed_tools": _coerce_tool_list(r.get("allowed_tools"), none_ok=True),
+                        "disallowed_tools": _coerce_tool_list(r.get("disallowed_tools")) or [],
+                        "auth_type": r.get("auth_type") or "headers",
+                        "auth_config": _coerce_json_obj(r.get("auth_config")) or {},
                     }
                     for r in (rows or [])
                 ]
@@ -300,44 +426,197 @@ class ClientMCPManager:
                 resolved_env[k] = v
         return resolved_env
 
+    def _resolve_headers(
+        self, env_vars: dict, *, namespace: str, client_id: str, server_name: str = "",
+    ) -> dict[str, str]:
+        """Resolve HTTP headers for a remote MCP server.
+
+        Mirrors ``_resolve_env`` — expands ``secret:<name>`` refs through the
+        same three-tier credential store — but returns a plain dict suitable
+        for passing to the MCP HTTP client. Unlike ``_resolve_env`` this does
+        NOT start from ``os.environ``: headers are only what the caller
+        explicitly configured (plus any resolved secret values).
+        """
+        if not env_vars:
+            return {}
+        # Reuse the env resolver over an empty base, then strip the os.environ
+        # inheritance by keeping only keys the caller declared.
+        env_before = dict(env_vars)
+        resolved = self._resolve_env(env_vars, namespace=namespace,
+                                     client_id=client_id, server_name=server_name)
+        return {k: str(resolved.get(k, "")) for k in env_before}
+
+    def _resolve_secret_value(
+        self, value: str, *, namespace: str, client_id: str, server_name: str,
+    ) -> str:
+        """Resolve a single possibly-``secret:``-prefixed value to a literal.
+
+        Reuses the three-tier resolution in ``_resolve_headers`` (which handles
+        both literal and ``secret:<name>`` inputs) over a one-key dict.
+        """
+        if not value:
+            return ""
+        return self._resolve_headers(
+            {"_v": value}, namespace=namespace, client_id=client_id,
+            server_name=server_name,
+        ).get("_v", "")
+
+    async def _apply_auth(
+        self, headers: dict[str, str], config: dict, *,
+        namespace: str, client_id: str, server_name: str,
+    ) -> dict[str, str]:
+        """Layer a typed auth scheme onto already-resolved HTTP headers.
+
+        ``auth_type`` (with ``auth_config``):
+          * ``headers`` (default) — no-op; env_vars already ARE the headers.
+          * ``bearer_token`` — inject ``Authorization: Bearer <token>`` where
+            ``auth_config.token`` may be a ``secret:`` ref.
+          * ``oauth2_client_credentials`` — run the OAuth2 client-credentials
+            grant against ``auth_config.token_url`` and inject the bearer,
+            caching the access token until shortly before expiry.
+          * ``aws_sigv4`` — not yet supported (needs per-request signing);
+            logged and skipped.
+        """
+        auth_type = (config.get("auth_type") or "headers").lower()
+        if auth_type in ("", "headers", "none"):
+            return headers
+        ac = config.get("auth_config") or {}
+
+        if auth_type == "bearer_token":
+            token = self._resolve_secret_value(
+                ac.get("token", ""), namespace=namespace,
+                client_id=client_id, server_name=server_name,
+            )
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            return headers
+
+        if auth_type == "oauth2_client_credentials":
+            token = await self._oauth2_client_credentials_token(
+                ac, namespace=namespace, client_id=client_id, server_name=server_name,
+            )
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            return headers
+
+        logger.warning(
+            "MCP %s/%s: auth_type '%s' not supported — sending headers as-is",
+            client_id, server_name, auth_type,
+        )
+        return headers
+
+    async def _oauth2_client_credentials_token(
+        self, ac: dict, *, namespace: str, client_id: str, server_name: str,
+    ) -> str | None:
+        """Fetch (and cache) an OAuth2 client-credentials access token."""
+        key = (client_id, server_name)
+        cached = self._oauth_tokens.get(key)
+        if cached and time.time() < cached[1]:
+            return cached[0]
+        token_url = ac.get("token_url") or ""
+        oauth_client_id = ac.get("client_id") or ""
+        if not token_url or not oauth_client_id:
+            logger.error(
+                "MCP %s/%s: oauth2 requires auth_config.token_url + client_id",
+                client_id, server_name,
+            )
+            return None
+        client_secret = self._resolve_secret_value(
+            ac.get("client_secret", ""), namespace=namespace,
+            client_id=client_id, server_name=server_name,
+        )
+        data = {"grant_type": "client_credentials",
+                "client_id": oauth_client_id, "client_secret": client_secret}
+        if ac.get("scope"):
+            data["scope"] = ac["scope"]
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=30) as c:
+                resp = await c.post(token_url, data=data)
+                resp.raise_for_status()
+                payload = resp.json()
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "MCP %s/%s: oauth2 token fetch failed: %s",
+                client_id, server_name, e,
+            )
+            return None
+        token = payload.get("access_token")
+        if not token:
+            logger.error("MCP %s/%s: oauth2 response had no access_token",
+                         client_id, server_name)
+            return None
+        # Cache until 60s before expiry (default 1h if the server omits it).
+        expires_in = float(payload.get("expires_in", 3600) or 3600)
+        self._oauth_tokens[key] = (token, time.time() + max(0.0, expires_in - 60))
+        return token
+
     async def _connect(
         self, client_id: str, config: dict, namespace: str = "default"
     ) -> ClientMCPConnection | None:
         """Connect to a single MCP server for a client.
 
-        ``secret:`` env refs resolve through the three-tier credential store
-        namespace-first, then user (derived from a ``user:<id>`` client_id),
-        then platform — i.e. "run with namespace credentials if available,
-        otherwise user credentials"."""
-        package = config.get("package", "")
+        Supports two transports keyed by ``config['transport']``:
+
+        * ``'stdio'`` (default) — spawn the ``package`` as a subprocess
+          (uvx/npx). ``env_vars`` become child env vars; ``secret:`` refs
+          resolve through the three-tier credential store (namespace → user
+          → platform).
+        * ``'streamable-http'`` — dial the MCP endpoint at ``config['url']``.
+          ``env_vars`` are sent as HTTP headers on the outbound request,
+          with the same ``secret:`` resolution.
+
+        HTTP+SSE (the pre-2025-03-26 MCP HTTP transport) is intentionally
+        not supported — the MCP spec superseded it with Streamable HTTP.
+        """
         server_name = config.get("server_name", "")
         env_vars = config.get("env_vars", {})
-        extra_args = config.get("args", [])
+        transport_kind = (config.get("transport") or "stdio").lower()
 
-        if not package:
-            return None
-
-        # Determine command based on package type
-        if package.startswith("@") or package.startswith("mcp-server-"):
-            command = "npx"
-            args = ["-y", package] + extra_args
+        if transport_kind == "streamable-http":
+            url = config.get("url") or ""
+            if not url:
+                logger.error(
+                    "MCP %s/%s transport=streamable-http requires a url",
+                    client_id, server_name,
+                )
+                return None
+            if not HAS_MCP_HTTP:
+                logger.error(
+                    "MCP %s/%s: streamable-http requested but "
+                    "mcp.client.streamable_http is not installed",
+                    client_id, server_name,
+                )
+                return None
+            headers = self._resolve_headers(env_vars, namespace=namespace,
+                                             client_id=client_id, server_name=server_name)
+            headers = await self._apply_auth(
+                headers, config, namespace=namespace,
+                client_id=client_id, server_name=server_name,
+            )
+            transport = streamablehttp_client(url, headers=headers)
+            read_stream, write_stream, _ = await transport.__aenter__()
+            session = ClientSession(read_stream, write_stream)
+            await session.__aenter__()
         else:
-            command = "uvx"
-            args = [package] + extra_args
-
-        resolved_env = self._resolve_env(env_vars, namespace=namespace, client_id=client_id,
-                                         server_name=server_name)
-
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=resolved_env,
-        )
-
-        transport = stdio_client(server_params)
-        read_stream, write_stream = await transport.__aenter__()
-        session = ClientSession(read_stream, write_stream)
-        await session.__aenter__()
+            # stdio (default) — existing subprocess launcher.
+            package = config.get("package", "")
+            extra_args = config.get("args", [])
+            if not package:
+                return None
+            command, args = resolve_launch_command(package, extra_args)
+            resolved_env = self._resolve_env(env_vars, namespace=namespace, client_id=client_id,
+                                             server_name=server_name)
+            # BigQuery/Drive/Vertex MCP servers authenticate via ADC (a key FILE);
+            # turn a service-account JSON secret into GOOGLE_APPLICATION_CREDENTIALS.
+            resolved_env = materialize_gcp_credentials(resolved_env)
+            server_params = StdioServerParameters(
+                command=command, args=args, env=resolved_env,
+            )
+            transport = stdio_client(server_params)
+            read_stream, write_stream = await transport.__aenter__()
+            session = ClientSession(read_stream, write_stream)
+            await session.__aenter__()
         # uvx/npx-launched servers (esp. heavy Python ones like mcp-atlassian on
         # first run) can take well over 10s to import + handshake. Configurable
         # via FORGEOS_MCP_INIT_TIMEOUT; default generous.

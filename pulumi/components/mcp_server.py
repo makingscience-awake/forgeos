@@ -1,15 +1,15 @@
 """Helios OS MCP Server on Cloud Run (FastMCP streamable-http).
 
-Serves src/forgeos_mcp as a remote MCP endpoint so any MCP client (Claude,
-Cursor, …) can reach the fleet over HTTP instead of spawning a local stdio
-process. It's HTTP-native — it just calls the platform API — so it runs as its
-own scale-to-zero Cloud Run service pointed at the platform API URL, reusing
-the platform-api image with a CMD override (no separate image/build).
+Serves the standalone `forgeos_mcp` package (bitbucket.org/i2tic/helios-os-mcp)
+as a remote MCP endpoint so any MCP client (Claude, Cursor, …) can reach the
+fleet over HTTP. The image is the dedicated `forgeos/forgeos-mcp` repo — its
+CMD already runs `python -m forgeos_mcp --transport streamable-http --port
+$PORT`, so we don't override commands here.
 
 Auth: the server presents FORGEOS_API_KEY to the platform API as X-API-Key,
-validated against tenants.api_key_hash (Phase 2). The key is wired only when
-its Secret Manager version exists, so a versionless secret doesn't break the
-Service (Cloud Run validates secret_key_ref :latest at deploy).
+validated against tenants.api_key_hash. The key is wired only when its Secret
+Manager version exists, so a versionless secret doesn't break the Service
+(Cloud Run validates secret_key_ref :latest at deploy).
 """
 
 from __future__ import annotations
@@ -54,7 +54,10 @@ class McpServer(pulumi.ComponentResource):
 
         self.service = gcp.cloudrunv2.Service(
             f"{name}-svc",
-            name="forgeos-mcp",
+            # Helios OS canonical name. The previous "forgeos-mcp" service is
+            # implicitly deleted on the next `pulumi up` (Cloud Run service
+            # names are immutable, so the provider deletes + recreates).
+            name="helios-mcp",
             location=region,
             ingress="INGRESS_TRAFFIC_ALL",
             deletion_protection=False,
@@ -70,10 +73,10 @@ class McpServer(pulumi.ComponentResource):
                 containers=[
                     gcp.cloudrunv2.ServiceTemplateContainerArgs(
                         image=image,
-                        # Reuse the platform-api image; run the MCP server on
-                        # streamable-http bound to 0.0.0.0:8080 (Cloud Run port).
-                        commands=["python", "-m", "src.forgeos_mcp"],
-                        args=["--transport", "streamable-http", "--port", "8080", "--host", "0.0.0.0"],
+                        # The dedicated forgeos-mcp image reads $PORT (Cloud
+                        # Run sets it to whatever container_port we declare)
+                        # and binds FastMCP's streamable-http transport there.
+                        # Default Cloud Run port is 8080 — match it.
                         ports=gcp.cloudrunv2.ServiceTemplateContainerPortsArgs(
                             container_port=8080,
                         ),

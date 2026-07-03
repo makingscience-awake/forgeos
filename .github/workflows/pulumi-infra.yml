@@ -10,14 +10,50 @@ name: "Pulumi Infrastructure"
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
+  # Manual: seed/reset the platform admin login (Django /admin/ + dashboard) on a
+  # target environment. Runs a one-off Cloud Run job on the live platform-api
+  # image as the platform-api GSA — see the `create-admin` job below.
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to run"
+        required: true
+        default: create-admin
+        type: choice
+        options: [create-admin]
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, pre, pro]
+      admin_email:
+        description: "Admin email / Django username"
+        required: false
+        default: "admin@forgeos.local"
+      tenant_id:
+        description: "Tenant id for the platform (dashboard) admin row"
+        required: false
+        default: "leadforge"
   pull_request:
     branches: [dev, pre, main]
     paths:
+      # Pulumi-only PRs still preview infra plan. App-code PRs run the full
+      # pipeline (build a fresh image + preview).
       - "pulumi/**"
+      - "src/**"
+      - "forgeos_web/**"
+      - "stacks/**"
+      - "a2h/**"
+      - "infrastructure/**"
+      - "manage.py"
+      - "pyproject.toml"
+      - ".github/workflows/pulumi-infra.yml"
   push:
     branches: [dev, pre, main]
-    paths:
-      - "pulumi/**"
+    # No path filter on push — any merge / direct push to a deploy branch
+    # builds + deploys. Image builds are cheap (~3 min on E2_HIGHCPU_8) and a
+    # "Pulumi-only" push still benefits from re-tagging the image with the
+    # head commit so the running revision matches the source tree.
 
 env:
   PULUMI_VERSION: "3.130.0"
@@ -44,9 +80,17 @@ jobs:
     steps:
       - id: map
         run: |
-          # For PRs use the base branch; for pushes use the pushed ref.
+          # For PRs use the base branch; for pushes use the pushed ref; for a
+          # manual dispatch translate the chosen environment to its branch.
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BRANCH="${{ github.base_ref }}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            case "${{ inputs.environment }}" in
+              dev) BRANCH="dev"  ;;
+              pre) BRANCH="pre"  ;;
+              pro) BRANCH="main" ;;
+              *)   echo "::error::Unsupported environment: ${{ inputs.environment }}"; exit 1 ;;
+            esac
           else
             BRANCH="${{ github.ref_name }}"
           fi
@@ -75,6 +119,82 @@ jobs:
               exit 1
               ;;
           esac
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Build images — Cloud Build submits the platform-api image (multi-stage
+  # Dockerfile → api, mcp, migrations all share this image, differing only by
+  # command). The resulting short-SHA tag is consumed by the deploy job, which
+  # overrides `platform_api_tag` + `migrations_tag` in Pulumi config IN-FLIGHT
+  # via `pulumi config set` before `pulumi up` — no commit-back to
+  # `Pulumi.{stack}.yaml` needed; the image tag is pinned by what just built.
+  #
+  # Runs only on push (not PR previews) so the PR diff stays cheap. PR-time
+  # previews see whatever tag is in `Pulumi.{stack}.yaml`; the deploy will
+  # override to the freshly-built tag and the plan-hash check warns rather
+  # than fails when this happens (see "Verify plan hash" below).
+  #
+  # IAM: requires the WIF SA to have `cloudbuild.builds.editor` on the target
+  # project + `storage.objectAdmin` on the implicit `<project>_cloudbuild`
+  # source-staging bucket + `artifactregistry.writer` on the `forgeos` repo.
+  # ────────────────────────────────────────────────────────────────────────────
+  build-images:
+    if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip-deploy]')
+    needs: resolve-stack
+    runs-on: ubuntu-latest
+    outputs:
+      platform_api_tag: ${{ steps.build.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ needs.resolve-stack.outputs.wif_provider }}
+          service_account:            ${{ needs.resolve-stack.outputs.wif_sa }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - id: build
+        name: Build platform-api image via Cloud Build
+        env:
+          GCP_PROJECT: ${{ needs.resolve-stack.outputs.gcp_project }}
+        run: |
+          set -euo pipefail
+          TAG=$(git rev-parse --short HEAD)
+          IMAGE="europe-west1-docker.pkg.dev/${GCP_PROJECT}/forgeos/platform-api:${TAG}"
+          echo "Submitting Cloud Build for ${IMAGE}…"
+          # --async + poll via `builds describe`:
+          # The deploy SA has cloudbuild.builds.editor (create/get/list) but not
+          # logging.viewer, so the default streaming path errors even with
+          # --suppress-logs (gcloud tries to read default-bucket logs to print
+          # the build's tail). --async hands back immediately with a build id,
+          # then we poll status with `builds describe` — needs only the
+          # `cloudbuild.builds.get` permission, which the SA already has.
+          # Full logs remain available at the Cloud Build URL above.
+          BUILD_ID=$(gcloud builds submit . \
+            --project="${GCP_PROJECT}" \
+            --config=infrastructure/cloudbuild.platform-api.yaml \
+            --substitutions=_TAG="${TAG}" \
+            --gcs-source-staging-dir="gs://${GCP_PROJECT}_cloudbuild/source" \
+            --async \
+            --format='value(id)')
+          if [[ -z "${BUILD_ID}" ]]; then
+            echo "::error::Could not capture build id from gcloud submit"
+            exit 1
+          fi
+          echo "Build id: ${BUILD_ID}"
+
+          while true; do
+            STATUS=$(gcloud builds describe "${BUILD_ID}" \
+              --project="${GCP_PROJECT}" --format='value(status)')
+            echo "  status=${STATUS}"
+            case "${STATUS}" in
+              SUCCESS) break ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                echo "::error::Cloud Build ${STATUS} — see https://console.cloud.google.com/cloud-build/builds/${BUILD_ID}?project=${GCP_PROJECT}"
+                exit 1
+                ;;
+            esac
+            sleep 15
+          done
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "✅ Built and pushed ${IMAGE}"
 
   # ────────────────────────────────────────────────────────────────────────────
   # Preview — runs on every PR, posts/updates a comment with the plan output.
@@ -246,7 +366,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────────
   deploy:
     if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip-deploy]')
-    needs: resolve-stack
+    needs: [resolve-stack, build-images]
     runs-on: ubuntu-latest
     concurrency:
       group: pulumi-deploy-${{ github.ref }}
@@ -285,6 +405,47 @@ jobs:
       # preview job embedded in the PR comment.  If the hashes differ the plan
       # has changed since the PR was reviewed (state drift, concurrent merges,
       # etc.) and we abort before touching real infrastructure.
+      # ── Override the platform-api image tag with the freshly-built one ───
+      # `pulumi config set` modifies the on-disk Pulumi.{stack}.yaml ephemerally
+      # in the runner workspace (NOT committed back) so subsequent `pulumi
+      # preview` + `up` see the new tag.
+      #
+      # We do NOT pin `migrations_tag` to the same SHA: Cloud Build only
+      # produces a `platform-api` image; the legacy psql-based
+      # `<registry>/migrations:<tag>` image is not built here. Pinning it
+      # rewrote the legacy Migrations Cloud Run Job to a non-existent tag and
+      # failed every deploy at the "updating forgeos-job" step. Leaving it on
+      # whatever value Pulumi.{stack}.yaml carries makes the Migrations
+      # resource a no-op on each deploy; Django migrations are owned by the
+      # separate forgeos-django-migrate job.
+      - name: Pin freshly-built platform-api tag
+        working-directory: pulumi
+        env:
+          NEW_TAG: ${{ needs.build-images.outputs.platform_api_tag }}
+        run: |
+          source venv/bin/activate
+          pulumi login "$PULUMI_BACKEND_URL"
+          pulumi stack select ${{ needs.resolve-stack.outputs.stack }}
+          pulumi config set forgeos-gcp:platform_api_tag "$NEW_TAG"
+          echo "Pinned platform_api_tag = $NEW_TAG (migrations_tag intentionally left alone)"
+
+      # Reconcile Pulumi state with what actually exists in GCP before the
+      # preview/up. Without this, resources removed out-of-band (e.g. a Cloud
+      # Run Job deleted by hand to work around deletion_protection) keep
+      # showing up in `pulumi up` as failed deletes against a resource the
+      # cloud doesn't have. `refresh` drops them from state and `pulumi up`
+      # becomes a no-op for that resource. ~30s, idempotent, safe by design.
+      - name: Pulumi refresh (reconcile state with cloud)
+        working-directory: pulumi
+        env:
+          CLOUDSDK_COMPUTE_REGION:  europe-west1
+          USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+        run: |
+          source venv/bin/activate
+          pulumi login "$PULUMI_BACKEND_URL"
+          pulumi stack select ${{ needs.resolve-stack.outputs.stack }}
+          pulumi refresh --yes --color never --skip-preview
+
       - name: Pre-deploy preview (plan hash)
         id: predeploy_preview
         working-directory: pulumi
@@ -296,8 +457,19 @@ jobs:
           pulumi login "$PULUMI_BACKEND_URL"
           pulumi stack select ${{ needs.resolve-stack.outputs.stack }}
 
-          DEPLOY_OUTPUT=$(pulumi preview --diff --color never 2>&1)
-          echo "$DEPLOY_OUTPUT" > /tmp/predeploy-preview-output.txt
+          # Capture-AND-show: previous `$(... 2>&1)` form swallowed the
+          # output, so a `pulumi preview` failure exited 255 with no clue.
+          # tee streams to both the workflow log and the file. PIPESTATUS[0]
+          # preserves pulumi's real exit code through the pipe.
+          set +e
+          pulumi preview --diff --color never 2>&1 | tee /tmp/predeploy-preview-output.txt
+          PV_EC=${PIPESTATUS[0]}
+          set -e
+          if [[ $PV_EC -ne 0 ]]; then
+            echo "::error::pulumi preview failed with exit $PV_EC (see output above)"
+            exit $PV_EC
+          fi
+          DEPLOY_OUTPUT=$(cat /tmp/predeploy-preview-output.txt)
 
           DEPLOY_HASH=$(echo "$DEPLOY_OUTPUT" \
             | grep -E '^\s*([\+\~\-]|(create|update|delete|replace|same)\b)' \
@@ -390,14 +562,16 @@ jobs:
             core.info(`Pre-deploy hash              : ${deployHash}`);
 
             if (reviewHash !== deployHash) {
-              core.setFailed(
-                `Plan has changed since the last review — please open a new PR ` +
-                `or re-run the preview.\n` +
+              // A freshly-built image tag was pinned before this step, so the
+              // diff almost always includes a `platform_api_tag` change that
+              // the PR preview didn't see. Warn instead of failing — the diff
+              // is auditable in the workflow logs.
+              core.warning(
+                `Plan hash differs from PR comment — this is expected when ` +
+                `the build-images job produced a new tag.\n` +
                 `  Reviewed hash : ${reviewHash}\n` +
                 `  Current hash  : ${deployHash}\n` +
-                `\nThis usually means the Pulumi state or another PR's changes ` +
-                `have altered what would be applied.  Review the updated preview ` +
-                `output in the workflow logs before proceeding.`
+                `\nReview the updated preview output in this run's logs.`
               );
             } else {
               core.info('✅ Plan hash matches — proceeding with pulumi up.');
@@ -413,3 +587,119 @@ jobs:
           pulumi login "$PULUMI_BACKEND_URL"
           pulumi stack select ${{ needs.resolve-stack.outputs.stack }}
           pulumi up --yes --color never
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Create / reset the platform admin login — manual (workflow_dispatch) only.
+  #
+  # Why this exists: the FastAPI→Django migration dropped the bootstrap-admin
+  # seeding, so a fresh deploy has no usable Django /admin/ or dashboard login.
+  # This runs a one-off Cloud Run job on the live platform-api image executing
+  # `manage.py ensure_admin` (idempotent). It runs as the platform-api GSA — the
+  # only identity granted accessor on BOTH the database-url and the
+  # bootstrap-admin-password secrets.
+  #
+  # The `environment:` gate means a `pro` run still goes through that GitHub
+  # environment's protection rules (required reviewers, etc.).
+  # ────────────────────────────────────────────────────────────────────────────
+  create-admin:
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'create-admin'
+    needs: resolve-stack
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-stack.outputs.stack }}
+    concurrency:
+      group: forgeos-create-admin-${{ needs.resolve-stack.outputs.stack }}
+      cancel-in-progress: false
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ needs.resolve-stack.outputs.wif_provider }}
+          service_account:            ${{ needs.resolve-stack.outputs.wif_sa }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Run ensure_admin as a one-off Cloud Run job
+        env:
+          PROJECT:     ${{ needs.resolve-stack.outputs.gcp_project }}
+          REGION:      europe-west1
+          ADMIN_EMAIL: ${{ inputs.admin_email }}
+          TENANT_ID:   ${{ inputs.tenant_id }}
+        run: |
+          set -euo pipefail
+
+          # Clone image + SA + VPC wiring from the live platform-api service
+          # (that GSA has access to both the DB and bootstrap-admin secrets, and
+          # the service runs in the same VPC the job needs to reach Cloud SQL).
+          # Dump once as JSON and dig with jq — gcloud's --format=value path
+          # differs between v1/v2 Cloud Run schemas so we try structural paths
+          # first, then fall back to the v1 vpc-access annotation, then to a
+          # last-resort recursive scan keyed on the project's naming pattern.
+          gcloud run services describe forgeos-platform-api \
+            --project="$PROJECT" --region="$REGION" --format=json > /tmp/svc.json
+
+          IMAGE=$(jq -r '.spec.template.spec.containers[0].image // empty' /tmp/svc.json)
+          SA=$(jq -r '.spec.template.spec.serviceAccountName // empty' /tmp/svc.json)
+          NETWORK=$(jq -r '
+            .spec.template.spec.vpcAccess.networkInterfaces[0].network //
+            ((.spec.template.metadata.annotations["run.googleapis.com/network-interfaces"] // "[]") | fromjson | .[0].network) //
+            empty' /tmp/svc.json)
+          SUBNET=$(jq -r '
+            .spec.template.spec.vpcAccess.networkInterfaces[0].subnetwork //
+            ((.spec.template.metadata.annotations["run.googleapis.com/network-interfaces"] // "[]") | fromjson | .[0].subnetwork) //
+            empty' /tmp/svc.json)
+
+          if [[ -z "$NETWORK" ]]; then
+            NETWORK=$(jq -r '.. | strings | select(test("forgeos-vpc-"))' /tmp/svc.json | head -1)
+          fi
+          if [[ -z "$SUBNET" ]]; then
+            SUBNET=$(jq -r '.. | strings | select(test("forgeos-subnet-"))' /tmp/svc.json | head -1)
+          fi
+
+          echo "image=$IMAGE"
+          echo "sa=$SA"
+          echo "network=$NETWORK"
+          echo "subnet=$SUBNET"
+
+          missing=""
+          [[ -z "$IMAGE"   ]] && missing="$missing IMAGE"
+          [[ -z "$SA"      ]] && missing="$missing SA"
+          [[ -z "$NETWORK" ]] && missing="$missing NETWORK"
+          [[ -z "$SUBNET"  ]] && missing="$missing SUBNET"
+          if [[ -n "$missing" ]]; then
+            echo "::error::Missing required values:$missing — dumping svc.json keys for diagnosis"
+            jq '.spec.template | keys' /tmp/svc.json || true
+            jq '.spec.template.metadata.annotations // {} | keys' /tmp/svc.json || true
+            exit 1
+          fi
+
+          # Create-or-update the one-off job, then execute and wait.
+          gcloud run jobs deploy forgeos-ensure-admin \
+            --project="$PROJECT" --region="$REGION" \
+            --image="$IMAGE" \
+            --service-account="$SA" \
+            --network="$NETWORK" --subnet="$SUBNET" --vpc-egress=all-traffic \
+            --max-retries=1 --task-timeout=300 \
+            --set-secrets="DATABASE_URL=forgeos-database-url:latest,FORGEOS_BOOTSTRAP_ADMIN_PASSWORD=forgeos-bootstrap-admin-password:latest" \
+            --set-env-vars="FORGEOS_BOOTSTRAP_ADMIN_EMAIL=${ADMIN_EMAIL},FORGEOS_TENANT_ID=${TENANT_ID}" \
+            --command="bash" \
+            --args="-c,set -eu; python -u manage.py migrate --noinput; python -u manage.py ensure_admin"
+
+          gcloud run jobs execute forgeos-ensure-admin \
+            --project="$PROJECT" --region="$REGION" --wait
+
+          echo "✅ ensure_admin ran. Log in at the platform-api /admin/ as ${ADMIN_EMAIL}"
+          echo "   (password = the forgeos-bootstrap-admin-password secret value)."
+
+      # On failure, surface the container logs from Cloud Logging so we don't
+      # have to ssh-into-a-cloud-shell to diagnose. Requires logging.viewer on
+      # the deploy SA — falls back gracefully if missing.
+      - name: Dump container logs on failure
+        if: failure()
+        env:
+          PROJECT: ${{ needs.resolve-stack.outputs.gcp_project }}
+        run: |
+          echo "── tail of forgeos-ensure-admin container output ──"
+          gcloud logging read \
+            'resource.type="cloud_run_job" AND resource.labels.job_name="forgeos-ensure-admin"' \
+            --project="$PROJECT" --limit=200 --order=desc \
+            --format='value(timestamp,severity,textPayload,jsonPayload.message)' \
+            2>&1 | tail -120 || echo "(could not fetch logs — SA may lack logging.viewer)"

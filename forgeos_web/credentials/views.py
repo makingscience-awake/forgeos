@@ -2,12 +2,10 @@
 
 Ported 1:1 from src/dashboard/fastapi_app.py (the ``create_fastapi_app`` factory):
   - /api/credentials/github   POST              (4247)
-  - /api/credentials/jira     POST              (4482)
   - /api/credentials/secret   POST              (4270)
   - /api/secrets              GET/POST/DELETE    (4334, 4366, 4395)
 
-All of these were ``Depends(check_auth)`` in FastAPI (the jira route used
-``Depends(current_user)``, which itself runs check_auth) — none used
+All of these were ``Depends(check_auth)`` in FastAPI — none used
 ``require_role``. They therefore rely on the global default permission
 (IsAuthenticatedOrPublicPath) and set no ``permission_classes`` here.
 
@@ -113,14 +111,6 @@ class CredentialPutGithubSerializer(serializers.Serializer):
     user_id = serializers.CharField(required=False, default="default")
 
 
-class CredentialPutJiraSerializer(serializers.Serializer):
-    """Mirror of fastapi_app.CredentialPutJiraRequest (line 201)."""
-
-    url = serializers.CharField()
-    email = serializers.CharField()
-    token = serializers.CharField(min_length=8)
-    user_id = serializers.CharField(required=False, default="default")
-
 
 class CredentialPutSecretSerializer(serializers.Serializer):
     """Mirror of fastapi_app.CredentialPutSecretRequest (line 207)."""
@@ -212,47 +202,6 @@ class CredentialSecretView(APIView):
         return Response({"stored": True, "name": req["name"], "kind": req["kind"]})
 
 
-class CredentialJiraView(APIView):
-    """POST /api/credentials/jira — store an Atlassian credential (fastapi_app.py:4482).
-
-    FastAPI used ``Depends(current_user)`` for the acting user; here that is the
-    X-Forgeos-User header (default "default"), which ``acting_user`` resolves.
-    """
-
-    def post(self, request):
-        from forgeos_web.authn.context import acting_user
-
-        ctx = di.get_context()
-        if ctx.credential_store is None:
-            return Response({"detail": "Credential store not configured"}, status=503)
-        ser = CredentialPutJiraSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        req = ser.validated_data
-        user = acting_user(request)
-        uid = req["user_id"] if req["user_id"] and req["user_id"] != "default" else user
-        caller = _caller(request)
-        try:
-            ok = ctx.credential_store.put_jira(
-                url=req["url"], email=req["email"], token=req["token"],
-                user_id=uid, caller=caller,
-            )
-        except ValueError as e:
-            return Response({"detail": str(e)}, status=400)
-        if not ok:
-            return Response(
-                {"detail": "No writable secret backend; credential was not stored"},
-                status=503,
-            )
-        _audit(
-            "credential.write",
-            actor=caller,
-            resource_type="credential",
-            resource_id=f"jira:{uid}",
-            details={"kind": "jira"},
-        )
-        return Response({"stored": True, "user_id": uid, "kind": "jira"})
-
-
 class SecretsView(APIView):
     """GET/POST/DELETE /api/secrets — three-tier scoped secrets (fastapi_app.py:4334/4366/4395).
 
@@ -291,7 +240,9 @@ class SecretsView(APIView):
         except Exception as e:  # noqa: BLE001
             logger.warning("list_scoped_secrets failed: %s", e)
             rows = []
-        return Response({"scope": scope, "namespace": namespace, "secrets": rows})
+        from forgeos_web.common.pagination import paginate
+        paged = paginate(rows, request, default=20)
+        return Response({"scope": scope, "namespace": namespace, **paged})
 
     def post(self, request):
         ctx = di.get_context()

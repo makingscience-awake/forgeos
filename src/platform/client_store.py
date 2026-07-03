@@ -13,6 +13,70 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+
+
+_TRANSPORTS = ("stdio", "streamable-http")
+
+
+def _coerce_tool_list(value, *, none_ok: bool = False) -> list[str] | None:
+    """Normalize a JSONB tool-name column to a list[str] (or None).
+
+    psycopg may hand back a decoded ``list`` or a raw JSON ``str`` depending on
+    adapters. ``none_ok`` preserves NULL as None (allow-all semantics for
+    ``allowed_tools``); otherwise NULL collapses to None and the caller applies
+    its own ``or []`` default.
+    """
+    if value is None:
+        return None if none_ok else None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return None
+
+
+def _coerce_json_obj(value):
+    """Normalize a JSONB object column to a dict (psycopg may hand back str)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def _validate_transport_shape(transport: str, package: str, url: str | None) -> None:
+    """Enforce transport-shape invariants above the DB CHECK constraint.
+
+    stdio → package required, url must be empty. streamable-http → url required
+    (with an http/https scheme). Raises ValueError on shape mismatch so callers
+    surface a clean 400 instead of relying on a raw psql CHECK failure.
+
+    HTTP+SSE (the pre-2025-03-26 MCP HTTP transport) is intentionally not
+    accepted — the MCP spec superseded it with Streamable HTTP.
+    """
+    if transport not in _TRANSPORTS:
+        raise ValueError(
+            f"transport must be one of {_TRANSPORTS!r}, got {transport!r}"
+        )
+    if transport == "stdio":
+        if not package:
+            raise ValueError("stdio transport requires a package")
+        if url:
+            raise ValueError("stdio transport must not carry a url")
+    else:  # streamable-http
+        if not url:
+            raise ValueError("streamable-http transport requires a url")
+        scheme = (url.split(":", 1)[0] or "").lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(
+                f"streamable-http url scheme must be http or https, got {url!r}"
+            )
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -161,15 +225,46 @@ class PostgresClientMCPStore:
         package: str,
         env_vars: dict | None = None,
         args: list[str] | None = None,
+        *,
+        transport: str = "stdio",
+        url: str | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+        auth_type: str = "headers",
+        auth_config: dict | None = None,
     ) -> dict:
-        """Add an MCP server config. Raises ValueError if a duplicate exists."""
+        """Add an MCP server config. Raises ValueError if a duplicate exists.
+
+        ``transport``: one of ``'stdio'`` (default), ``'streamable-http'``, ``'sse'``.
+        ``url``: required for HTTP transports, must be None for stdio (the CHECK
+        constraint enforces this at the DB layer too).
+        ``allowed_tools``: bare upstream tool names to expose (None = allow all).
+        ``disallowed_tools``: bare upstream tool names to hide (subtracted after
+        the allow-list).
+        ``auth_type`` / ``auth_config``: typed auth for streamable-http servers
+        (``headers`` default = env_vars are the headers).
+        """
+        _validate_transport_shape(transport, package, url)
+        # Normalize the stored URL (empty string → NULL) so the CHECK constraint
+        # stays happy for stdio and the DB never contains ambiguous empties.
+        url = url or None
+        auth_type = auth_type or "headers"
         config = {
             "server_name": server_name,
             "package": package,
             "env_vars": env_vars or {},
             "args": args or [],
             "enabled": True,
+            "transport": transport,
+            "url": url,
+            "allowed_tools": allowed_tools,
+            "disallowed_tools": disallowed_tools or [],
+            "auth_type": auth_type,
+            "auth_config": auth_config or {},
         }
+        _allowed_json = json.dumps(allowed_tools) if allowed_tools is not None else None
+        _disallowed_json = json.dumps(disallowed_tools) if disallowed_tools else None
+        _auth_json = json.dumps(auth_config) if auth_config else None
 
         if self._has_db:
             try:
@@ -185,10 +280,15 @@ class PostgresClientMCPStore:
                         )
                     conn.execute(
                         "INSERT INTO client_mcp_configs "
-                        "(tenant_id, client_id, server_name, package, env_vars, args, enabled) "
-                        "VALUES (%s, %s, %s, %s, %s::jsonb, %s, true)",
+                        "(tenant_id, client_id, server_name, package, env_vars, args, "
+                        "enabled, transport, url, allowed_tools, disallowed_tools, "
+                        "auth_type, auth_config) "
+                        "VALUES (%s, %s, %s, %s, %s::jsonb, %s, true, %s, %s, "
+                        "%s::jsonb, %s::jsonb, %s, %s::jsonb)",
                         (self._tenant_id, client_id, server_name, package,
-                         json.dumps(env_vars or {}), args or []),
+                         json.dumps(env_vars or {}), args or [],
+                         transport, url, _allowed_json, _disallowed_json,
+                         auth_type, _auth_json),
                     )
                     conn.commit()
                 self._memory.setdefault(client_id, []).append(config)
@@ -215,7 +315,9 @@ class PostgresClientMCPStore:
             try:
                 with self._db.tenant(self._tenant_id) as conn:
                     rows = conn.execute(
-                        "SELECT server_name, package, env_vars, args, enabled "
+                        "SELECT server_name, package, env_vars, args, enabled, "
+                        "transport, url, allowed_tools, disallowed_tools, "
+                        "auth_type, auth_config "
                         "FROM client_mcp_configs "
                         "WHERE client_id = %s AND tenant_id = %s ORDER BY server_name",
                         (client_id, self._tenant_id),
@@ -229,6 +331,12 @@ class PostgresClientMCPStore:
                             ),
                             "args": r.get("args") or [],
                             "enabled": bool(r.get("enabled", True)),
+                            "transport": r.get("transport") or "stdio",
+                            "url": r.get("url"),
+                            "allowed_tools": _coerce_tool_list(r.get("allowed_tools"), none_ok=True),
+                            "disallowed_tools": _coerce_tool_list(r.get("disallowed_tools")) or [],
+                            "auth_type": r.get("auth_type") or "headers",
+                            "auth_config": _coerce_json_obj(r.get("auth_config")) or {},
                         }
                         for r in (rows or [])
                     ]
@@ -239,10 +347,15 @@ class PostgresClientMCPStore:
             configs = list(self._memory.get(client_id, []))
 
         if redact_secrets:
-            configs = [
-                {**c, "env_vars": {k: "***" for k in c.get("env_vars", {})}}
-                for c in configs
-            ]
+            def _redact(c: dict) -> dict:
+                out = {**c, "env_vars": {k: "***" for k in c.get("env_vars", {})}}
+                ac = c.get("auth_config")
+                if isinstance(ac, dict) and ac:
+                    # Redact auth_config values (may hold a literal client_secret /
+                    # bearer token) but keep the keys so the UI shows the shape.
+                    out["auth_config"] = {k: "***" for k in ac}
+                return out
+            configs = [_redact(c) for c in configs]
         return configs
 
     def get(self, client_id: str, server_name: str) -> dict | None:
@@ -259,15 +372,34 @@ class PostgresClientMCPStore:
         package: str,
         env_vars: dict | None = None,
         args: list[str] | None = None,
+        *,
+        transport: str = "stdio",
+        url: str | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+        auth_type: str = "headers",
+        auth_config: dict | None = None,
     ) -> dict | None:
         """Update an existing MCP config. Returns the new config or None if not found."""
+        _validate_transport_shape(transport, package, url)
+        url = url or None
+        auth_type = auth_type or "headers"
         new_config = {
             "server_name": server_name,
             "package": package,
             "env_vars": env_vars or {},
             "args": args or [],
             "enabled": True,
+            "transport": transport,
+            "url": url,
+            "allowed_tools": allowed_tools,
+            "disallowed_tools": disallowed_tools or [],
+            "auth_type": auth_type,
+            "auth_config": auth_config or {},
         }
+        _allowed_json = json.dumps(allowed_tools) if allowed_tools is not None else None
+        _disallowed_json = json.dumps(disallowed_tools) if disallowed_tools else None
+        _auth_json = json.dumps(auth_config) if auth_config else None
 
         if self._has_db:
             try:
@@ -275,9 +407,14 @@ class PostgresClientMCPStore:
                     rc = conn.execute(
                         "UPDATE client_mcp_configs SET "
                         "package = %s, env_vars = %s::jsonb, args = %s, "
+                        "transport = %s, url = %s, "
+                        "allowed_tools = %s::jsonb, disallowed_tools = %s::jsonb, "
+                        "auth_type = %s, auth_config = %s::jsonb, "
                         "updated_at = NOW() "
                         "WHERE client_id = %s AND server_name = %s AND tenant_id = %s",
                         (package, json.dumps(env_vars or {}), args or [],
+                         transport, url, _allowed_json, _disallowed_json,
+                         auth_type, _auth_json,
                          client_id, server_name, self._tenant_id),
                     )
                     conn.commit()
@@ -321,3 +458,101 @@ class PostgresClientMCPStore:
 
     def count_for_client(self, client_id: str) -> int:
         return len(self.list_for_client(client_id))
+
+
+class PostgresMcpAccessGroupStore:
+    """Tenant-scoped store for `mcp_access_groups` (migration 024).
+
+    A group is a named bundle of MCP server-names. Agents reference one by name
+    via `metadata.mcp_access_group`; the MCP layer intersects the agent's
+    in-scope servers with the group's `server_names`. Same DB/in-memory-fallback
+    style as the client stores above.
+    """
+
+    def __init__(self, db_client, tenant_id: str = "default"):
+        self._db = db_client
+        self._tenant_id = tenant_id
+        self._memory: dict[str, list[str]] = {}
+
+    @property
+    def _has_db(self) -> bool:
+        return bool(self._db and getattr(self._db, "is_connected", False))
+
+    def list_groups(self) -> list[dict]:
+        if self._has_db:
+            try:
+                with self._db.tenant(self._tenant_id) as conn:
+                    rows = conn.execute(
+                        "SELECT name, server_names, created_at FROM mcp_access_groups "
+                        "WHERE tenant_id = %s ORDER BY name",
+                        (self._tenant_id,),
+                    )
+                return [
+                    {
+                        "name": r["name"],
+                        "server_names": _coerce_tool_list(r.get("server_names")) or [],
+                        "created_at": (
+                            r["created_at"].isoformat() if r.get("created_at") else None
+                        ),
+                    }
+                    for r in (rows or [])
+                ]
+            except Exception as e:
+                logger.warning("Failed to list MCP access groups: %s", e)
+        return [
+            {"name": n, "server_names": list(s), "created_at": None}
+            for n, s in self._memory.items()
+        ]
+
+    def get(self, name: str) -> list[str] | None:
+        """Return the group's server_names, or None if the group doesn't exist."""
+        if self._has_db:
+            try:
+                with self._db.tenant(self._tenant_id) as conn:
+                    row = conn.execute_one(
+                        "SELECT server_names FROM mcp_access_groups "
+                        "WHERE tenant_id = %s AND name = %s",
+                        (self._tenant_id, name),
+                    )
+                if row is None:
+                    return None
+                return _coerce_tool_list(row.get("server_names")) or []
+            except Exception as e:
+                logger.warning("Failed to get MCP access group %s: %s", name, e)
+        return list(self._memory[name]) if name in self._memory else None
+
+    def upsert(self, name: str, server_names: list[str]) -> dict:
+        names = [str(s) for s in (server_names or [])]
+        if self._has_db:
+            try:
+                with self._db.tenant(self._tenant_id) as conn:
+                    conn.execute(
+                        "INSERT INTO mcp_access_groups (tenant_id, name, server_names) "
+                        "VALUES (%s, %s, %s::jsonb) "
+                        "ON CONFLICT (tenant_id, name) DO UPDATE SET "
+                        "server_names = EXCLUDED.server_names, updated_at = NOW()",
+                        (self._tenant_id, name, json.dumps(names)),
+                    )
+                    conn.commit()
+            except Exception as e:
+                logger.warning("Failed to upsert MCP access group %s: %s", name, e)
+        self._memory[name] = names
+        return {"name": name, "server_names": names}
+
+    def delete(self, name: str) -> bool:
+        removed = False
+        if self._has_db:
+            try:
+                with self._db.tenant(self._tenant_id) as conn:
+                    rc = conn.execute(
+                        "DELETE FROM mcp_access_groups WHERE tenant_id = %s AND name = %s",
+                        (self._tenant_id, name),
+                    )
+                    conn.commit()
+                    removed = bool(rc)
+            except Exception as e:
+                logger.warning("Failed to delete MCP access group %s: %s", name, e)
+        if name in self._memory:
+            del self._memory[name]
+            removed = True
+        return removed

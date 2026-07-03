@@ -166,9 +166,14 @@ class ForgeOSAdapter(AgentStackAdapter):
             # Merge the acting user's per-user MCP tool schemas (e.g. their JIRA
             # via mcp-atlassian) so the LLM sees them on the inline path too.
             try:
-                _cid = build_agent_context(agent_def, agent_id, context=context).get("client_id")
+                _actx = build_agent_context(agent_def, agent_id, context=context)
+                # Aggregate across the agent's full permitted scope chain
+                # (own + broader/shared), not just the single client_id, and
+                # narrow to the agent's MCP access group if one is set.
+                _chain = _actx.get("mcp_scope_chain") or _actx.get("client_id")
                 tools = await append_client_mcp_tools(
-                    tools, self._tool_executor, _cid, agent_def.tools or None,
+                    tools, self._tool_executor, _chain, agent_def.tools or None,
+                    access_group=_actx.get("mcp_access_group"),
                 )
             except Exception:
                 logger.debug("client MCP tool merge failed for %s", agent_id, exc_info=True)
@@ -276,6 +281,13 @@ class ForgeOSAdapter(AgentStackAdapter):
                 status=AgentStatus.PAUSED,
                 output="",
                 tokens_used=outcome.tokens_used,
+                # Surface tool events even on PAUSE so the chat stream renders
+                # the calls that already completed BEFORE the HITL pause (e.g.
+                # the agent ran search_drive + bigquery, then parked on
+                # notify_email). Mirrors the COMPLETED branch below; without
+                # this the pre-approval bubble shows only the HITL chip and
+                # the operator can't see what the agent actually did.
+                tool_calls=outcome.tool_events or [],
                 metadata={
                     "continuation_id": outcome.continuation_id,
                     "suspend_reason": outcome.suspend_reason,

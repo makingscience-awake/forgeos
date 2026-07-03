@@ -21,7 +21,11 @@ urlpatterns = [
     path("api/platform/mcp/servers", views.PlatformMcpServersView.as_view()),
     path("api/platform/mcp/servers/<str:server_name>",
          views.PlatformMcpServerDetailView.as_view()),
-    path("api/users/<str:user_id>/mcp/jira", views.UserJiraMcpView.as_view()),
+    # `/mcp/jira` was a Jira-specific enroll shortcut. Removed — the generic
+    # per-server endpoint below handles Jira (and every other MCP) uniformly.
     path("api/users/<str:user_id>/mcp/<str:server_name>", views.UserMcpView.as_view()),
     path("api/namespaces/<str:ns>/mcp/<str:server_name>", views.NamespaceMcpView.as_view()),
+    # MCP access groups (migration 024) — Django-native (no FastAPI equivalent).
+    path("api/mcp/access-groups", views.McpAccessGroupsView.as_view()),
+    path("api/mcp/access-groups/<str:name>", views.McpAccessGroupDetailView.as_view()),
 ]

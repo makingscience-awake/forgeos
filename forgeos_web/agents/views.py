@@ -47,12 +47,61 @@ def _visible_namespaces(uid: str) -> set[str]:
     return set(member_store.namespaces_for_user(uid)) | set(admin_store.namespaces_for_user(uid))
 
 
+def _can_create_agent(
+    uid: str, role: str, *, namespace: str, ownership: str,
+) -> tuple[bool, str]:
+    """Whether ``(uid, role)`` may CREATE an agent with the given namespace/ownership.
+
+    Mirrors ``_can_access_agent``'s read rules so a user can never write into
+    a namespace they can't see:
+
+      - admin → always
+      - PERSONAL → allowed for anyone (owner_id defaults to the acting user in
+        ``_create_agent``, and only the owner can then access it)
+      - SHARED + namespace='default' → allowed (tenant-wide bucket; every
+        authenticated user can already see + create in the tenant-wide space)
+      - SHARED + other namespace → must be an effective member (member or
+        admin) of that namespace
+      - CLIENT → admin/operator only
+
+    Returns ``(ok, reason)``. ``reason`` is a human-readable message the API
+    surfaces on refusal.
+    """
+    if role == "admin":
+        return True, ""
+    own = (ownership or "").lower()
+    ns = (namespace or "default").strip() or "default"
+    if own == "personal":
+        return True, ""
+    if own == "shared":
+        if ns == "default":
+            return True, ""
+        from src.platform.namespace_admins import is_effective_member
+        member_store, admin_store = _access_stores()
+        if is_effective_member(uid, ns, member_store=member_store, admin_store=admin_store):
+            return True, ""
+        return False, (
+            f"You are not a member of namespace '{ns}'. Ask a namespace admin "
+            f"to add you, or choose 'personal' ownership."
+        )
+    if own == "client":
+        if role == "operator":
+            return True, ""
+        return False, "CLIENT ownership requires an operator or admin role."
+    return False, f"Unknown ownership '{ownership}'."
+
+
 def _can_access_agent(uid: str, role: str, agent_def, *, my_namespaces: set[str] | None = None) -> bool:
     """Whether ``(uid, role)`` may see/run/edit ``agent_def``.
 
     - tenant admin → always
     - PERSONAL → only the ``owner_id``
-    - SHARED → any effective member of the agent's namespace
+    - SHARED + namespace=``default`` → tenant-wide (any authenticated user).
+      ``default`` is the implicit tenant bucket — no Namespace row is required
+      and no membership table exists for it. Treating it as restrictive made
+      the wizard's "tenant" ownership unusable: agents got created in
+      ``default`` and the creator couldn't see them back.
+    - SHARED + other namespace → any effective member of that namespace
     - CLIENT/unknown → admin/operator only (unchanged from the pre-RBAC default)
 
     ``my_namespaces`` (precomputed member∪admin set) lets the list view avoid a
@@ -66,6 +115,9 @@ def _can_access_agent(uid: str, role: str, agent_def, *, my_namespaces: set[str]
         return bool(owner) and owner == uid
     if own == "shared":
         ns = getattr(agent_def, "namespace", None) or "default"
+        if ns == "default":
+            # Tenant-wide: visible to every authenticated user in this tenant.
+            return True
         if my_namespaces is not None:
             return ns in my_namespaces
         from src.platform.namespace_admins import is_effective_member
@@ -180,6 +232,57 @@ def _enrich_runs(runs: list[dict]) -> list[dict]:
         for c in conts:
             # A run_id maps to one continuation; last writer wins if duplicated.
             cont_by_run[c["run_id"]] = c
+        # Correlation fallback when Continuation.run_id is NULL (the runtime
+        # engine doesn't set it for non-top-level continuations). Match by
+        # (pid, created_at within the run's start/end window). started_at /
+        # ended_at arrive as ISO strings here (see agent_runs_store._serialize)
+        # — parse them back to datetimes for the comparison.
+        from datetime import datetime as _dt, timedelta as _td
+
+        def _parse_iso(v):
+            if v is None or isinstance(v, _dt):
+                return v
+            if not isinstance(v, str):
+                return None
+            try:
+                return _dt.fromisoformat(v.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        missing = [r for r in runs if r.get("id") not in cont_by_run and r.get("agent_id")]
+        if missing:
+            from django.db.models import Q as _Q
+            q = _Q()
+            buckets: list[tuple] = []  # (run_id, agent_id, started_dt, ended_dt)
+            for r in missing:
+                started_dt = _parse_iso(r.get("started_at"))
+                ended_dt = _parse_iso(r.get("ended_at"))
+                if not started_dt:
+                    continue
+                buckets.append((r["id"], r["agent_id"], started_dt, ended_dt))
+                sub = _Q(pid=r["agent_id"], created_at__gte=started_dt - _td(seconds=2))
+                if ended_dt:
+                    sub &= _Q(created_at__lte=ended_dt + _td(seconds=5))
+                q |= sub
+            if buckets:
+                try:
+                    fallback = list(
+                        Continuation.all_objects.filter(q)
+                        .order_by("-created_at")
+                        .values("id", "pid", "created_at", "session_id", "source")
+                    )
+                except Exception:
+                    fallback = []
+                for run_id_v, agent_id_v, started_dt, ended_dt in buckets:
+                    for c in fallback:
+                        if c["pid"] != agent_id_v:
+                            continue
+                        if c["created_at"] < started_dt - _td(seconds=2):
+                            continue
+                        if ended_dt and c["created_at"] > ended_dt + _td(seconds=5):
+                            continue
+                        cont_by_run[run_id_v] = c
+                        break
         cont_ids = [c["id"] for c in conts]
         if cont_ids:
             for row in (
@@ -360,8 +463,15 @@ def _validated_agent_request(data: dict) -> _Req:
 # --------------------------------------------------------------------------- #
 # Shared create / update logic (ported from create_agent / _apply_agent_update)
 # --------------------------------------------------------------------------- #
-def _create_agent(req: _Req) -> Response:
-    """Port of fastapi_app:1024 create_agent. Returns a DRF Response."""
+def _create_agent(req: _Req, request=None) -> Response:
+    """Port of fastapi_app:1024 create_agent. Returns a DRF Response.
+
+    ``request`` is needed so PERSONAL agents can default ``owner_id`` to the
+    acting user when the caller didn't supply one. Without that default, the
+    agent gets stored with ``owner_id=None`` and `_can_access_agent` returns
+    False for everyone except admins — i.e. the creator can't see their own
+    agent in the list.
+    """
     ctx = di.get_context()
     platform_executor = ctx.platform_executor
     if not platform_executor:
@@ -373,6 +483,27 @@ def _create_agent(req: _Req) -> Response:
         if req.client_id:
             ownership = OwnershipType.CLIENT
             owner_id = req.client_id
+
+        # Namespace-membership gate. The read side (list/detail) filters by
+        # membership already; without the symmetric check on create, a
+        # non-member could write into a namespace they can't even see back
+        # (until this fix a plain "operator" could POST an agent into any
+        # namespace string just by naming it). Admins bypass. --no-auth
+        # local dev bypasses via ctx.auth_enabled == False.
+        if ctx.auth_enabled and request is not None:
+            uid, role = acting_principal(request, ctx)
+            requested_ns = req.namespace or "default"
+            ok, reason = _can_create_agent(
+                uid, role, namespace=requested_ns, ownership=req.ownership,
+            )
+            if not ok:
+                return Response({"detail": reason}, status=403)
+
+        # PERSONAL agents must have an owner; otherwise the creator can't
+        # even read their own agent back. Default to the acting user.
+        if ownership == OwnershipType.PERSONAL and not owner_id and request is not None:
+            uid, _role = acting_principal(request, ctx)
+            owner_id = uid or owner_id
         defn = AgentDefinition(
             name=req.name, stack=req.stack,
             execution_type=ExecutionType(req.execution_type),
@@ -395,6 +526,41 @@ def _create_agent(req: _Req) -> Response:
             ),
             system_prompt=req.system_prompt,
         )
+
+        # Auto-provision a dedicated GCP service account when the manifest asks
+        # for it (spec.drive.provision). Create it BEFORE deploy so the stored
+        # agent carries the real SA email; a failure here aborts creation (better
+        # than deploying a half-wired agent).
+        drive_meta = (defn.metadata or {}).get("_drive")
+        if isinstance(drive_meta, dict) and drive_meta.get("provision"):
+            from src.platform.gcp_provisioning import (
+                provision_agent_sa, ProvisioningError, default_project_id,
+            )
+            project_id = default_project_id()
+            if not project_id:
+                return Response(
+                    {"detail": "spec.drive.provision requested but no project could be "
+                               "determined (set GCP_PROJECT_ID on the platform)."}, status=400)
+            requested = (drive_meta.get("service_account") or "").strip()
+            slug = requested.split("@", 1)[0] if requested else (defn.name or "agent")
+            # BigQuery grant is opt-in via env: it needs the runtime SA to hold
+            # project IAM-admin (broad). Off by default → provisioning works with
+            # just roles/iam.serviceAccountAdmin.
+            import os as _os
+            grant_bq = _os.environ.get("FORGEOS_PROVISION_BIGQUERY", "").lower() in ("1", "true", "yes")
+            try:
+                sa_email = provision_agent_sa(slug, project_id=project_id, grant_bigquery=grant_bq)
+            except ProvisioningError as e:
+                _audit("agent.sa_provision", outcome="failure", resource_type="agent",
+                       resource_id=req.name, details={"error": str(e)})
+                return Response({"detail": f"Service account provisioning failed: {e}"}, status=502)
+            drive_meta["service_account"] = sa_email
+            drive_meta["provisioned"] = True
+            drive_meta.pop("provision", None)
+            defn.metadata["_drive"] = drive_meta
+            _audit("agent.sa_provision", resource_type="agent", resource_id=req.name,
+                   details={"service_account": sa_email, "project": project_id})
+
         agent_id = async_to_sync(platform_executor.deploy)(defn)
 
         digest: str | None = None
@@ -457,8 +623,18 @@ def _create_agent(req: _Req) -> Response:
         return Response({"detail": f"Agent deployment failed: {e}"}, status=400)
 
 
-def _apply_agent_update(agent_id: str, req: _Req, request) -> Response:
-    """Port of fastapi_app:1411 _apply_agent_update. Returns a DRF Response."""
+def _apply_agent_update(
+    agent_id: str, req: _Req, request, *, present_fields: set[str] | None = None
+) -> Response:
+    """Port of fastapi_app:1411 _apply_agent_update. Returns a DRF Response.
+
+    ``present_fields`` is the set of keys the client sent in the request body
+    (post-manifest-flattening). When provided, an update only applies a field
+    if the client actually sent it — so PUT can clear `goal`, `description`,
+    `tools`, etc. by sending the empty value. When None (legacy callers), the
+    old truthy-check semantics are kept so a partial body doesn't accidentally
+    blank out unspecified fields.
+    """
     ctx = di.get_context()
     platform_registry = ctx.platform_registry
     platform_executor = ctx.platform_executor
@@ -481,39 +657,48 @@ def _apply_agent_update(agent_id: str, req: _Req, request) -> Response:
 
     from stacks.base import ExecutionType, LLMConfig
 
-    if req.name and req.name != "string":
+    # If the caller passed present_fields, "sent" means "is in that set".
+    # Otherwise fall back to truthy (legacy partial-PUT semantics).
+    if present_fields is not None:
+        def sent(k: str) -> bool:
+            return k in present_fields
+    else:
+        def sent(k: str) -> bool:
+            v = getattr(req, k, None)
+            # mimic the old truthy guards: non-empty string / non-empty list
+            return bool(v)
+
+    if sent("name") and req.name and req.name != "string":
         agent_def.name = req.name
-    if req.description:
+    if sent("description"):
         agent_def.description = req.description
-    if req.system_prompt:
+    if sent("system_prompt"):
         agent_def.system_prompt = req.system_prompt
-    if req.tools:
+    if sent("tools"):
         agent_def.tools = req.tools
-    if req.schedule is not None:
+    if sent("schedule"):
         # A blank schedule (non-scheduled agents render it as "") means "no
         # schedule" — normalize to None so we don't store an empty cron string.
         agent_def.schedule = req.schedule or None
-    if req.event_triggers:
+    if sent("event_triggers"):
         agent_def.event_triggers = req.event_triggers
-    if req.department:
-        agent_def.department = req.department
-    if req.goal:
+    if sent("department"):
+        agent_def.department = req.department or None
+    if sent("goal"):
         agent_def.goal = req.goal
-    if req.metadata:
+    if sent("metadata") and req.metadata:
         agent_def.metadata.update(req.metadata)
     existing_llm = agent_def.llm_config
-    model_set = bool(req.chat_model) and req.chat_model != "gpt-4o"
-    provider_set = bool(req.provider) and req.provider != "openai"
-    req_endpoint = req.endpoint or None
-    req_api_key_ref = req.api_key_ref or None
-    if model_set or provider_set or req_endpoint is not None or req_api_key_ref is not None or req.llm_metadata:
+    llm_keys = ("chat_model", "provider", "endpoint", "api_key_ref", "llm_metadata")
+    if any(sent(k) for k in llm_keys):
         agent_def.llm_config = LLMConfig(
-            chat_model=req.chat_model if model_set else existing_llm.chat_model,
+            chat_model=(req.chat_model if sent("chat_model") else existing_llm.chat_model),
             reasoning_model=existing_llm.reasoning_model,
-            provider=req.provider if provider_set else existing_llm.provider,
-            endpoint=req_endpoint if req_endpoint is not None else existing_llm.endpoint,
-            api_key_ref=req_api_key_ref if req_api_key_ref is not None else existing_llm.api_key_ref,
-            metadata={**(existing_llm.metadata or {}), **(req.llm_metadata or {})},
+            provider=(req.provider if sent("provider") else existing_llm.provider),
+            endpoint=((req.endpoint or None) if sent("endpoint") else existing_llm.endpoint),
+            api_key_ref=((req.api_key_ref or None) if sent("api_key_ref") else existing_llm.api_key_ref),
+            metadata=({**(existing_llm.metadata or {}), **(req.llm_metadata or {})}
+                      if sent("llm_metadata") else (existing_llm.metadata or {})),
         )
 
     new_exec = req.execution_type
@@ -537,10 +722,14 @@ def _apply_agent_update(agent_id: str, req: _Req, request) -> Response:
     return Response(agent_def.to_dict())
 
 
-def _coerce_agent_update(request) -> _Req:
+def _coerce_agent_update(request) -> tuple[_Req, set[str]]:
     """Build a flat _Req from the PUT body, accepting flat fields or a k8s-style
-    manifest. Ported from fastapi_app:1378. Raises serializers.ValidationError
-    on bad input (DRF renders 400)."""
+    manifest. Returns (req, present_fields) where present_fields is the set of
+    keys the client actually sent (after manifest flattening) — used by
+    _apply_agent_update to distinguish "omit this field" from "clear this field
+    to empty". Raises serializers.ValidationError on bad input (DRF -> 400).
+    Ported from fastapi_app:1378.
+    """
     body = request.data
     if not isinstance(body, dict):
         raise serializers.ValidationError({"detail": "Body must be a JSON object"})
@@ -554,7 +743,10 @@ def _coerce_agent_update(request) -> _Req:
         if ns and "namespace" not in deploy_body:
             deploy_body["namespace"] = ns
         body = deploy_body
-    return _validated_agent_request(body)
+    # Snapshot the keys the client sent BEFORE the serializer fills defaults
+    # — that's how we know whether '' / [] meant 'clear' vs 'not provided'.
+    present = {k for k in body.keys() if isinstance(k, str)}
+    return _validated_agent_request(body), present
 
 
 # --------------------------------------------------------------------------- #
@@ -590,14 +782,14 @@ class AgentsView(APIView):
         owner_id = qp.get("owner_id")
         department = qp.get("department")
         client_id = qp.get("client_id")
-        limit = int(qp.get("limit", 50))
-        offset = int(qp.get("offset", 0))
+        from forgeos_web.common.pagination import paginate, parse_page
+        page, page_size = parse_page(request)
 
         if not platform_registry:
             if admin_tools:
                 agents = admin_tools.list_agents(department=department)
-                return Response(agents[offset:offset + limit] if isinstance(agents, list) else [])
-            return Response([])
+                return Response(paginate(agents if isinstance(agents, list) else [], request))
+            return Response(paginate([], request))
         filters = {}
         if stack:
             filters["stack"] = stack
@@ -625,7 +817,10 @@ class AgentsView(APIView):
                 a for a in all_agents
                 if _can_access_agent(uid, role, a, my_namespaces=my_ns)
             ]
-        agents = all_agents[offset:offset + limit]
+
+        total = len(all_agents)
+        start = (page - 1) * page_size
+        agents = all_agents[start:start + page_size]
 
         out = []
         for a in agents:
@@ -641,11 +836,11 @@ class AgentsView(APIView):
             except Exception:
                 pass
             out.append(d)
-        return Response(out)
+        return Response({"items": out, "total": total, "page": page, "page_size": page_size})
 
     def post(self, request):
         req = _validated_agent_request(request.data)
-        return _create_agent(req)
+        return _create_agent(req, request)
 
 
 # --------------------------------------------------------------------------- #
@@ -676,7 +871,7 @@ class AgentsFromYamlView(APIView):
             req = _validated_agent_request(deploy_body)
         except serializers.ValidationError as e:
             return Response({"detail": f"Manifest did not match deploy schema: {e}"}, status=400)
-        return _create_agent(req)
+        return _create_agent(req, request)
 
 
 # --------------------------------------------------------------------------- #
@@ -706,8 +901,8 @@ class AgentDetailView(APIView):
         return Response({"detail": f"Agent {agent_id} not found"}, status=404)
 
     def put(self, request, agent_id):
-        req = _coerce_agent_update(request)
-        return _apply_agent_update(agent_id, req, request)
+        req, present = _coerce_agent_update(request)
+        return _apply_agent_update(agent_id, req, request, present_fields=present)
 
     def delete(self, request, agent_id):
         ctx = di.get_context()
@@ -725,7 +920,23 @@ class AgentDetailView(APIView):
                 allowed = role in ("admin", "operator") or (own == "personal" and owner == uid)
                 if not allowed:
                     return Response({"detail": "Not authorized to delete this agent"}, status=403)
+            # Capture a platform-provisioned SA (if any) before undeploy so we can
+            # clean it up. Only SAs WE created (_drive.provisioned) are deletable —
+            # never a user-supplied service_account.
+            provisioned_sa = None
+            if existed:
+                dm = (getattr(agent_def, "metadata", None) or {}).get("_drive") or {}
+                if dm.get("provisioned") and dm.get("service_account"):
+                    provisioned_sa = dm["service_account"]
             removed = bool(async_to_sync(platform_executor.undeploy)(agent_id)) and existed
+            if removed and provisioned_sa:
+                try:
+                    from src.platform.gcp_provisioning import deprovision_agent_sa, default_project_id
+                    deprovision_agent_sa(provisioned_sa, project_id=default_project_id())
+                    _audit("agent.sa_deprovision", resource_type="agent", resource_id=agent_id,
+                           details={"service_account": provisioned_sa})
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("deprovision SA %s failed: %s", provisioned_sa, e)
         _audit("agent.undeploy", resource_type="agent", resource_id=agent_id,
                details={"removed": removed})
         return Response({"ok": True, "removed": removed})
@@ -753,11 +964,15 @@ class AgentFromYamlUpdateView(APIView):
         if ns and "namespace" not in deploy_body:
             deploy_body["namespace"] = ns
         deploy_body.setdefault("metadata", {})["_source_yaml"] = body
+        # Same present-field tracking as _coerce_agent_update — every key in
+        # the user's YAML manifest is an explicit assertion, so it survives
+        # serializer-default fill-in for the partial-update semantics check.
+        present = {k for k in deploy_body.keys() if isinstance(k, str)}
         try:
             req = _validated_agent_request(deploy_body)
         except serializers.ValidationError as e:
             return Response({"detail": f"Manifest did not match deploy schema: {e}"}, status=400)
-        return _apply_agent_update(agent_id, req, request)
+        return _apply_agent_update(agent_id, req, request, present_fields=present)
 
 
 # --------------------------------------------------------------------------- #
@@ -978,19 +1193,22 @@ class RunsListView(APIView):
     def get(self, request):
         ctx = di.get_context()
         platform_executor = ctx.platform_executor
-        limit = int(request.query_params.get("limit", 100))
+        from forgeos_web.common.pagination import paginate
         agent_id = request.query_params.get("agent_id")
         source = request.query_params.get("source")
         if not platform_executor or not getattr(platform_executor, "agent_runs", None):
-            return Response({"runs": []})
+            return Response(paginate([], request))
+        # Fetch a generous batch so we can paginate server-side without touching
+        # the platform layer's DB queries (max 500; enough for all practical UIs).
+        fetch_limit = 500
         if agent_id:
-            runs = async_to_sync(platform_executor.agent_runs.list_for_agent)(agent_id, limit=limit)
+            runs = async_to_sync(platform_executor.agent_runs.list_for_agent)(agent_id, limit=fetch_limit)
         else:
-            runs = async_to_sync(platform_executor.agent_runs.list_recent)(limit=limit)
+            runs = async_to_sync(platform_executor.agent_runs.list_recent)(limit=fetch_limit)
         runs = _enrich_runs(runs)
         if source:
             runs = [r for r in runs if r.get("source") == source or r.get("trigger") == source]
-        return Response({"runs": runs})
+        return Response(paginate(runs, request, default=20))
 
 
 # --------------------------------------------------------------------------- #
@@ -1028,6 +1246,10 @@ class RunDetailView(APIView):
         ctx = di.get_context()
         # Live (in-memory) continuation for actively-running runs; durable ORM
         # continuation for completed history; agent_runs row for the summary.
+        # The {run_id} path param may carry EITHER an AgentRun.id (the canonical
+        # run_id) OR a Continuation.id (cont_xxx). A2A child runs are linked
+        # only by their continuation_id from the parent's tool_result, so the
+        # frontend deep-links by cont_xxx — accept both.
         live = _find_continuation(ctx, run_id)
         orm_cont = None
         run_row = None
@@ -1036,10 +1258,33 @@ class RunDetailView(APIView):
             from forgeos_web.agents.models import AgentRun
 
             orm_cont = Continuation.all_objects.filter(run_id=run_id).first()
+            if orm_cont is None:
+                # Fallback: maybe the caller passed a continuation_id directly.
+                orm_cont = Continuation.all_objects.filter(id=run_id).first()
             if orm_cont is None and live is not None:
                 orm_cont = Continuation.all_objects.filter(
                     id=live.continuation_id).first()
+            # Try run_id first; if the caller used a cont_id, derive run_id
+            # from the continuation we just found.
             run_row = AgentRun.all_objects.filter(id=run_id).first()
+            if run_row is None and orm_cont is not None and orm_cont.run_id:
+                run_row = AgentRun.all_objects.filter(id=orm_cont.run_id).first()
+            # Correlation fallback: Continuation.run_id isn't always populated
+            # by the runtime engine today (TOP-level runs come from invoke; A2A
+            # children + intermediate continuations leave it NULL). When the
+            # caller passed an AgentRun.id but we couldn't find a continuation
+            # via the FK, find the latest continuation whose `pid` matches the
+            # run's `agent_id` and whose `created_at` falls inside the run's
+            # window. This is heuristic but reliable in practice — one agent
+            # has at most one active continuation at a time per invocation.
+            if orm_cont is None and run_row is not None:
+                from datetime import timedelta
+                qs = Continuation.all_objects.filter(pid=run_row.agent_id)
+                if run_row.started_at is not None:
+                    qs = qs.filter(created_at__gte=run_row.started_at - timedelta(seconds=2))
+                if run_row.ended_at is not None:
+                    qs = qs.filter(created_at__lte=run_row.ended_at + timedelta(seconds=2))
+                orm_cont = qs.order_by("-created_at").first()
         except Exception:
             logger.debug("run detail durable lookup failed", exc_info=True)
 
@@ -1054,6 +1299,65 @@ class RunDetailView(APIView):
         raw_status = _cont_field(cont, "status", run_row.status if run_row else "")
         status = _CONT_STATUS_TO_RUN.get(raw_status, raw_status)
 
+        # If this run was delegated by another agent (A2A), surface the parent
+        # so the dashboard can render a "Called by" link back up the chain.
+        # The A2A code path stores the linkage in TWO places:
+        #   - Continuation.parent_continuation_id (the dedicated column), and
+        #   - the first user message's literal "Context: {...}" JSON block
+        #     containing `_delegation` (which is what the inline A2A path
+        #     actually populates today).
+        # Try the column first; fall back to parsing the user message context.
+        parent_cont_id = _cont_field(cont, "parent_continuation_id")
+        parent_run_id = None
+        parent_agent_id = None
+        if parent_cont_id:
+            try:
+                from forgeos_web.runtime.models import Continuation
+                parent = Continuation.all_objects.filter(id=parent_cont_id).only(
+                    "run_id", "pid").first()
+                if parent is not None:
+                    parent_run_id = parent.run_id
+                    parent_agent_id = parent.pid
+            except Exception:
+                logger.debug("parent continuation lookup failed", exc_info=True)
+        # call_path / parent_agent_id come from the inline-A2A path which only
+        # records `_delegation` in the user message context; the dedicated
+        # continuation column isn't populated for inline delegations. The
+        # `parent_run_id` inside _delegation is a synthetic 12-char trace id
+        # (a2a.py:246) — NOT a real AgentRun.id — so we deliberately DON'T
+        # surface it as a link target; we expose `parent_agent_id` instead so
+        # the dashboard can link to the parent agent's detail page.
+        parent_caller_name = None
+        if not parent_agent_id:
+            try:
+                mh = _cont_field(cont, "message_history", []) or []
+                for m in mh:
+                    if not isinstance(m, dict) or m.get("role") != "user":
+                        continue
+                    body = m.get("content")
+                    if not isinstance(body, str):
+                        continue
+                    marker = "Context: {"
+                    idx = body.find(marker)
+                    if idx < 0:
+                        continue
+                    import json as _json
+                    try:
+                        ctx_json = _json.loads(body[idx + len("Context: "):])
+                    except Exception:
+                        continue
+                    deleg = ctx_json.get("_delegation") or {}
+                    caller = ctx_json.get("_caller") or {}
+                    if deleg:
+                        cp = deleg.get("call_path") or []
+                        if len(cp) >= 2:
+                            parent_agent_id = cp[-2]
+                    if caller:
+                        parent_caller_name = caller.get("agent_name")
+                    break
+            except Exception:
+                logger.debug("delegation parse failed", exc_info=True)
+
         out: dict = {
             "run_id": run_id,
             "continuation_id": cont_id,
@@ -1065,6 +1369,10 @@ class RunDetailView(APIView):
             "step_index": _cont_field(cont, "step_index", 0),
             "resource_usage": _cont_field(cont, "resource_usage", {}) or {},
             "steps": _normalize_steps(_cont_field(cont, "message_history", []) or []),
+            "parent_continuation_id": parent_cont_id,
+            "parent_run_id": parent_run_id,
+            "parent_agent_id": parent_agent_id,
+            "parent_agent_name": parent_caller_name,
         }
 
         pending = _pending_from(cont)
