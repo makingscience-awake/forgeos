@@ -25,14 +25,15 @@ from __future__ import annotations
 
 import pulumi
 
+from components.admin_iam import Admin
 from components.dashboard import Dashboard
 from components.data import Data
 from components.django_migrate import DjangoMigrate
 from components.exec_environments import ExecEnvironments
+from components.flower import Flower
 from components.gke import Gke
 from components.identity import Identity
 from components.mcp_server import McpServer
-from components.migrations import Migrations
 from components.network import Network
 from components.platform_api import PlatformApi
 from components.registry import Registry
@@ -45,6 +46,14 @@ gcp_config = pulumi.Config("gcp")
 
 project: str = gcp_config.require("project")
 region: str = gcp_config.require("region")
+
+# Project-level admin grants — adds roles/owner to the configured principals.
+# Defaults to the toolshub.admin@group.makingscience.com Google Group so the
+# admin team can read secret values, exec Cloud Run jobs, see logs, and grant
+# further IAM without going through CI. Override via:
+#   pulumi config set --path 'admin_members[0]' group:other@group.example.com
+admin_members: list[str] | None = config.get_object("admin_members")  # type: ignore[assignment]
+Admin("forgeos-admin", project=project, members=admin_members)
 
 network_cidr: str = config.require("network_cidr")
 pods_cidr: str = config.require("pods_cidr")
@@ -72,11 +81,12 @@ environment: str = config.get("environment") or "dev"
 platform_api_tag: str = config.get("platform_api_tag") or "latest"
 migrations_tag: str = config.get("migrations_tag") or "latest"
 dashboard_tag: str = config.get("dashboard_tag") or "latest"
-# The remote MCP server (src/forgeos_mcp) was removed from the repo, so the
-# current platform-api image can't run `python -m src.forgeos_mcp`. Pin the
-# forgeos-mcp service to its own tag (its last image that still had that code)
-# so platform-api bumps don't break it. Defaults to platform_api_tag.
-mcp_tag: str = config.get("mcp_tag") or platform_api_tag
+# The remote MCP server lives in its own repo (bitbucket.org/i2tic/helios-os-mcp)
+# and pushes to a separate AR path: forgeos/forgeos-mcp. Its SHAs don't match
+# the platform-api SHAs, so don't inherit platform_api_tag here — default to
+# `latest` and override per-deploy via:
+#   pulumi config set forgeos-gcp:mcp_tag <short-sha>
+mcp_tag: str = config.get("mcp_tag") or "latest"
 
 # Qwen (vLLM) gateway — when set, agents on provider=vllm route here. The key
 # rides Secret Manager (vllm-api-key); the URL is plain config.
@@ -156,7 +166,7 @@ for sa, label in [
         secrets.grant_access(f"{label}-{secret_name}-access", secret, sa.email)
 
 secrets.grant_access("migrations-db-access", secrets.database_url, identity.migrations.email)
-secrets.grant_access("mcp-api-key-access", secrets.api_key, identity.mcp.email)
+secrets.grant_access("mcp-admin-key-access", secrets.admin_api_key, identity.mcp.email)
 # Auth secrets — platform-api only (worker/agent SAs don't authenticate users).
 secrets.grant_access("platform-api-admin-key-access", secrets.admin_api_key, identity.platform_api.email)
 secrets.grant_access("platform-api-dev-password-access", secrets.dashboard_password, identity.platform_api.email)
@@ -182,19 +192,15 @@ exec_environments = ExecEnvironments(
     k8s_provider=gke.provider,
 )
 
-# 8. Migrations — depends on the database-url SecretVersion (Cloud Run validates
-# secret_key_ref :latest at create-time, so the version must exist first).
-migrations = Migrations(
-    "forgeos",
-    region=region,
-    image=_img("migrations", migrations_tag),
-    gsa_email=identity.migrations.email,
-    database_url_secret=secrets.database_url.id,
-    vpc_network=network.network.id,
-    vpc_subnet=network.subnet.id,
-    environment=environment,
-    opts=pulumi.ResourceOptions(depends_on=[secrets.versions["database-url"]]),
-)
+# 8. Legacy SQL-migrations Cloud Run Job removed. It pointed at
+# `<registry>/migrations:<tag>` — an image Cloud Build never produces (CI
+# only builds platform-api). Django migrations are now applied by
+# forgeos-django-migrate (see DjangoMigrate below); the raw infrastructure/
+# database/*.sql schema is applied out-of-band when bringing up a fresh DB.
+# Removing the Migrations() call here makes the next `pulumi up` delete the
+# `forgeos-job` Cloud Run Job from each env. The
+# `forgeos-gcp:migrations_tag` config key in Pulumi.{stack}.yaml is now
+# unused — safe to leave or remove.
 
 # Django migrate job (platform-api image) — applies the Django migration graph
 # the raw-SQL job doesn't: auth/admin/sessions, django_celery_beat (Beat needs
@@ -247,6 +253,11 @@ _pa_extra_env: dict[str, pulumi.Input[str]] = {
     "FORGEOS_RUNTIME_V2": "1",
     "FORGEOS_RUNTIME_WORKERS": "1",
     "GCP_PROJECT_ID": project,
+    # The identity that impersonates auto-provisioned per-agent SAs at runtime is
+    # the GKE worker (agents run only in the worker tier). So when the platform-api
+    # provisions an agent SA (wizard "provision a service account"), it must grant
+    # token-creator to the WORKER GSA, not its own. gcp_provisioning reads this.
+    "FORGEOS_RUNTIME_SA_EMAIL": identity.agent_runtime.email,
     # Exec-environment sandbox: target the forgeos-envs namespace and reach the
     # cluster via a kubeconfig materialized from this content (no creds inside —
     # auth is the gke-gcloud-auth-plugin using the platform-api GSA's ADC).
@@ -323,6 +334,7 @@ worker = WorkerTier(
     image=_img("platform-api", platform_api_tag),
     project=project,
     k8s_provider=gke.provider,
+    gke_cluster=gke.cluster,
     agent_runtime_gsa=identity.agent_runtime,
     database_url=data.database_url,
     redis_url=data.redis_url,
@@ -332,16 +344,34 @@ worker = WorkerTier(
     environment=environment,
 )
 
-# 11. MCP Server — remote MCP endpoint (FastMCP streamable-http) on the
-# platform-api image, pointed at the platform API. Wires FORGEOS_API_KEY only
-# when the api-key secret has a version (else the Service deploy would fail
-# validating secret_key_ref :latest).
-_mcp_api_key_secret = secrets.api_key.id if "api-key" in secrets.versions else None
-_mcp_deps = [secrets.versions["api-key"]] if "api-key" in secrets.versions else []
+# 10b. Flower — Celery monitoring UI. Same namespace as the workers; reuses
+# the forgeos-worker-env Secret so REDIS_URL stays the one source of truth.
+# Reach via `kubectl -n forgeos-system port-forward svc/forgeos-flower 5555`.
+flower = Flower(
+    "forgeos",
+    k8s_provider=gke.provider,
+    gke_cluster=gke.cluster,
+    namespace="forgeos-system",
+    env_secret_name="forgeos-worker-env",
+    environment=environment,
+    opts=pulumi.ResourceOptions(depends_on=[worker]),
+)
+
+# 11. MCP Server — remote MCP endpoint (FastMCP streamable-http) on a
+# dedicated forgeos-mcp image. Source: bitbucket.org/i2tic/helios-os-mcp.
+#
+# FORGEOS_API_KEY comes from the ADMIN api key, not the tenant api key —
+# admin-gated tools (forgeos_deploy / forgeos_undeploy / etc.) need an admin
+# principal at the platform-api. AuthManager.verify_admin_key recognises
+# the value without a DB lookup, so this works on a fresh tenant. The
+# admin-api-key secret is auto-generated in secrets.py (length=48) — its
+# `:latest` version always exists, so no conditional wiring is needed.
+_mcp_api_key_secret = secrets.admin_api_key.id
+_mcp_deps = [secrets.versions["admin-api-key"]] if "admin-api-key" in secrets.versions else []
 mcp_server = McpServer(
     "forgeos",
     region=region,
-    image=_img("platform-api", mcp_tag),
+    image=_img("forgeos-mcp", mcp_tag),
     gsa_email=identity.mcp.email,
     platform_api_url=platform_api.url,
     api_key_secret=_mcp_api_key_secret,
@@ -371,7 +401,7 @@ pulumi.export("pubsub_agent_triggers", data.agent_triggers.name)
 pulumi.export("gke_cluster_name", gke.cluster.name)
 pulumi.export("gke_endpoint", pulumi.Output.secret(gke.cluster.endpoint))
 pulumi.export("platform_api_url", platform_api.url)
-pulumi.export("mcp_server_url", mcp_server.url)
+# mcp_server_url export removed with the McpServer resource (moves to its own repo).
 pulumi.export("dashboard_url", dashboard.url)
-pulumi.export("migrations_job", migrations.job.name)
+# migrations_job export removed with the legacy Migrations resource.
 pulumi.export("django_migrate_job", django_migrate.job.name)

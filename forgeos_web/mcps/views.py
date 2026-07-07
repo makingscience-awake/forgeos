@@ -6,7 +6,6 @@ Ported 1:1 from src/dashboard/fastapi_app.py:
   - /api/mcps/{name:path}                       (2440)
   - /api/platform/mcp/servers  GET/POST         (2688, 2717)
   - /api/platform/mcp/servers/{server_name} PUT/DELETE (2733, 2746)
-  - /api/users/{user_id}/mcp/jira  POST          (4509)
   - /api/users/{user_id}/mcp/{server_name} POST  (4543)
   - /api/namespaces/{ns}/mcp/{server_name} POST  (4603)
 
@@ -143,12 +142,67 @@ def _can_write_secret(request, ctx, scope: str, namespace: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 class ClientMCPConfigRequestSerializer(serializers.Serializer):
-    """Mirror of fastapi_app.ClientMCPConfigRequest (line 148)."""
+    """Register (or update) an MCP server for a client.
+
+    Two transport shapes:
+
+    * ``transport="stdio"`` (default, legacy): the platform spawns
+      ``package`` as a subprocess (``uvx`` or ``npx``). ``env_vars`` become
+      the child's env.
+    * ``transport="streamable-http"``: remote MCP endpoint. ``url`` is
+      required; ``env_vars`` are sent as HTTP headers on the outbound
+      request. ``package`` may be empty.
+
+    HTTP+SSE (the pre-2025-03-26 MCP HTTP transport) is intentionally not
+    exposed — the MCP spec superseded it with Streamable HTTP.
+
+    ``secret:<name>`` values in ``env_vars`` resolve through the three-tier
+    credential store in both shapes.
+    """
 
     server_name = serializers.CharField()
-    package = serializers.CharField()
+    package = serializers.CharField(required=False, allow_blank=True, default="")
     env_vars = serializers.DictField(required=False, default=dict)
     args = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    transport = serializers.ChoiceField(
+        choices=("stdio", "streamable-http"),
+        required=False, default="stdio",
+    )
+    url = serializers.CharField(required=False, allow_blank=True, default="")
+    # Per-server tool allow/deny (bare upstream tool names, e.g. "getJiraIssue").
+    # allowed_tools=None → expose every tool; disallowed_tools subtracts after.
+    allowed_tools = serializers.ListField(
+        child=serializers.CharField(), required=False, allow_null=True, default=None,
+    )
+    disallowed_tools = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list,
+    )
+    # Typed auth for streamable-http servers (default 'headers' = env_vars are
+    # the headers). See _parse_auth / ClientMCPManager._apply_auth.
+    auth_type = serializers.CharField(required=False, default="headers")
+    auth_config = serializers.DictField(required=False, default=dict)
+
+    def validate(self, attrs):
+        transport = attrs.get("transport") or "stdio"
+        package = (attrs.get("package") or "").strip()
+        url = (attrs.get("url") or "").strip()
+        if transport == "stdio":
+            if not package:
+                raise serializers.ValidationError({"package": "required for stdio transport"})
+            if url:
+                raise serializers.ValidationError({"url": "must be empty for stdio transport"})
+        else:
+            if not url:
+                raise serializers.ValidationError({"url": "required for streamable-http transport"})
+            scheme = (url.split(":", 1)[0] or "").lower()
+            if scheme not in ("http", "https"):
+                raise serializers.ValidationError(
+                    {"url": "must start with http:// or https://"}
+                )
+        attrs["transport"] = transport
+        attrs["url"] = url or None
+        attrs["package"] = package
+        return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -205,11 +259,15 @@ class McpPackageView(APIView):
 # Platform-scoped MCP servers.
 # ---------------------------------------------------------------------------
 
-def _connect_platform_mcp(ctx, server_name, package, env_vars, args) -> dict:
+def _connect_platform_mcp(
+    ctx, server_name, package, env_vars, args,
+    *, transport: str = "stdio", url: str | None = None,
+) -> dict:
     """Bring a platform MCP server up live and register its tools.
 
-    Port of fastapi_app.py:2693 (_connect_platform_mcp). The awaited
-    mcp_manager.connect_one is run via async_to_sync. Never raises.
+    Port of fastapi_app.py:2693 (_connect_platform_mcp), extended with
+    ``transport`` / ``url`` for remote (streamable-http, sse) MCPs. The
+    awaited mcp_manager.connect_one is run via async_to_sync. Never raises.
     """
     if ctx.mcp_manager is None or ctx.tool_executor is None:
         return {"connected": False, "tools_discovered": 0,
@@ -217,12 +275,37 @@ def _connect_platform_mcp(ctx, server_name, package, env_vars, args) -> dict:
     try:
         schemas = async_to_sync(ctx.mcp_manager.connect_one)(
             server_name, package, env_vars, args,
+            transport=transport, url=url,
         )
         ctx.tool_executor.register_mcp_tools(server_name, schemas)
         client = ctx.mcp_manager.get_clients().get(server_name)
         if client is not None:
             ctx.tool_executor._mcp_clients[server_name] = client
-        return {"connected": True, "tools_discovered": len(schemas)}
+        return {"connected": True, "tools_discovered": len(schemas),
+                "transport": transport}
+    except TypeError:
+        # Older MCPServerManager without transport support — fall back to
+        # the stdio-only signature so the deploy still succeeds when the
+        # platform image predates the HTTP branch.
+        if transport != "stdio":
+            logger.warning(
+                "MCP manager does not support transport=%s; refusing live connect for '%s'",
+                transport, server_name,
+            )
+            return {"connected": False, "tools_discovered": 0,
+                    "detail": f"platform build does not support transport={transport}"}
+        try:
+            schemas = async_to_sync(ctx.mcp_manager.connect_one)(
+                server_name, package, env_vars, args,
+            )
+            ctx.tool_executor.register_mcp_tools(server_name, schemas)
+            client = ctx.mcp_manager.get_clients().get(server_name)
+            if client is not None:
+                ctx.tool_executor._mcp_clients[server_name] = client
+            return {"connected": True, "tools_discovered": len(schemas), "transport": "stdio"}
+        except Exception as e:
+            logger.warning("Live connect failed (stdio fallback) for MCP '%s': %s", server_name, e)
+            return {"connected": False, "tools_discovered": 0, "detail": str(e)}
     except Exception as e:
         logger.warning("Live connect failed for MCP '%s': %s", server_name, e)
         return {"connected": False, "tools_discovered": 0, "detail": str(e)}
@@ -238,6 +321,13 @@ class PlatformMcpServersView(APIView):
         platform-scoped servers. ``?scope=all|user|namespace|tenant`` returns
         configs across client scopes, each tagged with its ``scope`` + ``owner``
         so the dashboard can show + filter by ownership level.
+
+        Caller-scoping: for non-admin callers the result is filtered so they
+        only see MCPs they have a legitimate stake in — own user-scope MCPs,
+        member namespace MCPs, and tenant-scope MCPs. Without this filter a
+        non-admin operator could enumerate every other user's user-scope MCP
+        (including secret keys, even though values are redacted).
+        Admins see everything (matches the agent list contract).
         """
         ctx = di.get_context()
         client_store, client_mcp_store = _client_stores(ctx)
@@ -245,6 +335,27 @@ class PlatformMcpServersView(APIView):
         if not scope or scope == "platform":
             return Response(
                 client_mcp_store.list_for_client(PLATFORM_CLIENT_ID, redact_secrets=True))
+
+        # Build the caller's allow-set (only used when role != admin).
+        uid, role = _acting_principal(request, ctx)
+        my_namespaces: set[str] = set()
+        if ctx.auth_enabled and role != "admin":
+            try:
+                from forgeos_web.agents.views import _visible_namespaces
+                my_namespaces = _visible_namespaces(uid)
+            except Exception as e:
+                logger.warning("MCP scope listing: _visible_namespaces(%s) failed: %s", uid, e)
+
+        def _visible_to_caller(s: str, owner: str) -> bool:
+            if role == "admin" or not ctx.auth_enabled:
+                return True
+            if s == "tenant":  # tenant-wide is visible to any authenticated user
+                return True
+            if s == "user":
+                return owner == uid
+            if s == "namespace":
+                return owner in my_namespaces
+            return False
 
         client_ids: list[str] = [PLATFORM_CLIENT_ID]
         try:
@@ -259,6 +370,8 @@ class PlatformMcpServersView(APIView):
             seen.add(cid)
             s, owner = _scope_owner(cid)
             if scope != "all" and s != scope:
+                continue
+            if not _visible_to_caller(s, owner):
                 continue
             try:
                 for row in client_mcp_store.list_for_client(cid, redact_secrets=True):
@@ -279,16 +392,22 @@ class PlatformMcpServersView(APIView):
             config = client_mcp_store.add(
                 PLATFORM_CLIENT_ID, req["server_name"], req["package"],
                 req["env_vars"], req["args"],
+                transport=req["transport"], url=req["url"],
+                allowed_tools=req.get("allowed_tools"),
+                disallowed_tools=req.get("disallowed_tools") or [],
+                auth_type=req.get("auth_type") or "headers",
+                auth_config=req.get("auth_config") or {},
             )
         except ValueError as e:
             logger.warning("Platform MCP conflict: %s", e)
             return Response({"detail": "MCP server configuration conflict"}, status=409)
         status = _connect_platform_mcp(
             ctx, req["server_name"], req["package"], req["env_vars"], req["args"],
+            transport=req["transport"], url=req["url"],
         )
         _audit("platform_mcp.add", resource_type="platform_mcp",
                resource_id=req["server_name"],
-               details={"package": req["package"], **status})
+               details={"package": req["package"], "transport": req["transport"], **status})
         return Response({**config, **status}, status=201)
 
 
@@ -304,15 +423,22 @@ class PlatformMcpServerDetailView(APIView):
         _, client_mcp_store = _client_stores(ctx)
         updated = client_mcp_store.update(
             PLATFORM_CLIENT_ID, server_name, req["package"], req["env_vars"], req["args"],
+            transport=req["transport"], url=req["url"],
+            allowed_tools=req.get("allowed_tools"),
+            disallowed_tools=req.get("disallowed_tools") or [],
+            auth_type=req.get("auth_type") or "headers",
+            auth_config=req.get("auth_config") or {},
         )
         if not updated:
             return Response(
                 {"detail": f"Platform MCP server '{server_name}' not found"}, status=404)
         status = _connect_platform_mcp(
             ctx, req["server_name"], req["package"], req["env_vars"], req["args"],
+            transport=req["transport"], url=req["url"],
         )
         _audit("platform_mcp.update", resource_type="platform_mcp",
-               resource_id=server_name, details={"package": req["package"], **status})
+               resource_id=server_name,
+               details={"package": req["package"], "transport": req["transport"], **status})
         return Response({**updated, **status})
 
     def delete(self, request, server_name):
@@ -336,47 +462,76 @@ class PlatformMcpServerDetailView(APIView):
 # Per-user MCP enrollment.
 # ---------------------------------------------------------------------------
 
-class UserJiraMcpView(APIView):
-    """POST /api/users/{user_id}/mcp/jira — wire a per-user JIRA MCP."""
+def _parse_mcp_transport(body: dict) -> tuple[str, str, str | None] | Response:
+    """Extract (package, transport, url) from a register-MCP body.
 
-    def post(self, request, user_id):
-        from src.platform.credentials import jira_secret_names
-
-        ctx = di.get_context()
-        client_store, client_mcp_store = _client_stores(ctx)
-        cid = f"user:{user_id}"
-        try:
-            if not client_store.exists(cid):
-                client_store.create(cid, f"user:{user_id}", {"kind": "user-mcp"})
-        except Exception as e:
-            logger.warning("enroll jira: client seed failed for %s: %s", cid, e)
-        names = jira_secret_names(user_id)
-        env_vars = {
-            "JIRA_URL": f"secret:{names['url']}",
-            "JIRA_USERNAME": f"secret:{names['email']}",
-            "JIRA_API_TOKEN": f"secret:{names['token']}",
-        }
-        try:
-            client_mcp_store.add(cid, "atlassian", "mcp-atlassian", env_vars, [])
-        except ValueError:
-            client_mcp_store.update(cid, "atlassian", "mcp-atlassian", env_vars, [])
-        _refresh_client_mcp_cache(ctx, client_mcp_store, cid)
-        _audit("user_mcp.enroll", resource_type="user_mcp", resource_id=cid,
-               details={"server": "atlassian", "package": "mcp-atlassian"})
+    Returns a 400 ``Response`` on shape mismatch. Rules match the platform-scope
+    serializer: ``stdio`` needs ``package`` and no ``url``; ``streamable-http``
+    needs ``url`` (http:// or https://) and does not require ``package``.
+    """
+    package = (body.get("package") or "").strip()
+    transport = (body.get("transport") or "stdio").strip() or "stdio"
+    url = (body.get("url") or "").strip()
+    if transport not in ("stdio", "streamable-http"):
         return Response(
-            {"enrolled": True, "client_id": cid, "server_name": "atlassian"}, status=201)
+            {"detail": f"transport must be 'stdio' or 'streamable-http', got '{transport}'"},
+            status=400,
+        )
+    if transport == "stdio":
+        if not package:
+            return Response({"detail": "`package` is required for stdio transport"}, status=400)
+        if url:
+            return Response({"detail": "`url` must be empty for stdio transport"}, status=400)
+        return package, "stdio", None
+    if not url:
+        return Response({"detail": "`url` is required for streamable-http transport"}, status=400)
+    scheme = (url.split(":", 1)[0] or "").lower()
+    if scheme not in ("http", "https"):
+        return Response({"detail": "`url` must start with http:// or https://"}, status=400)
+    return package, "streamable-http", url
+
+
+def _parse_tool_filters(body: dict) -> tuple[list[str] | None, list[str]]:
+    """Extract (allowed_tools, disallowed_tools) from a register-MCP body.
+
+    ``allowed_tools`` absent/null → None (allow every tool). ``disallowed_tools``
+    absent → []. Both are lists of bare upstream tool names.
+    """
+    raw_allowed = body.get("allowed_tools")
+    allowed = (
+        [str(t) for t in raw_allowed] if isinstance(raw_allowed, list) else None
+    )
+    raw_disallowed = body.get("disallowed_tools")
+    disallowed = (
+        [str(t) for t in raw_disallowed] if isinstance(raw_disallowed, list) else []
+    )
+    return allowed, disallowed
+
+
+def _parse_auth(body: dict) -> tuple[str, dict]:
+    """Extract (auth_type, auth_config) from a register-MCP body.
+
+    Defaults to ('headers', {}) — env_vars are the outbound headers.
+    """
+    auth_type = (body.get("auth_type") or "headers").strip() or "headers"
+    raw = body.get("auth_config")
+    auth_config = dict(raw) if isinstance(raw, dict) else {}
+    return auth_type, auth_config
 
 
 class UserMcpView(APIView):
-    """POST /api/users/{user_id}/mcp/{server_name} — register any MCP for a user."""
+    """POST/DELETE /api/users/{user_id}/mcp/{server_name} — per-user MCP CRUD."""
 
     def post(self, request, user_id, server_name):
         ctx = di.get_context()
         client_store, client_mcp_store = _client_stores(ctx)
         body = request.data if isinstance(request.data, dict) else {}
-        package = (body.get("package") or "").strip()
-        if not package:
-            return Response({"detail": "`package` is required"}, status=400)
+        parsed = _parse_mcp_transport(body)
+        if isinstance(parsed, Response):
+            return parsed
+        package, transport, url = parsed
+        allowed_tools, disallowed_tools = _parse_tool_filters(body)
+        auth_type, auth_config = _parse_auth(body)
         env_vars = dict(body.get("env_vars") or {})
         secrets = dict(body.get("secrets") or {})
         args = body.get("args") or []
@@ -408,22 +563,50 @@ class UserMcpView(APIView):
                 env_vars[key] = f"secret:{sname}"
 
         try:
-            client_mcp_store.add(cid, server_name, package, env_vars, args)
+            client_mcp_store.add(
+                cid, server_name, package, env_vars, args,
+                transport=transport, url=url,
+                allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+                auth_type=auth_type, auth_config=auth_config,
+            )
         except ValueError:
-            client_mcp_store.update(cid, server_name, package, env_vars, args)
+            client_mcp_store.update(
+                cid, server_name, package, env_vars, args,
+                transport=transport, url=url,
+                allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+                auth_type=auth_type, auth_config=auth_config,
+            )
         _refresh_client_mcp_cache(ctx, client_mcp_store, cid)
         _audit("user_mcp.enroll", resource_type="user_mcp", resource_id=cid,
                details={"server": server_name, "package": package,
+                        "transport": transport, "url": url,
+                        "allowed_tools": allowed_tools,
+                        "disallowed_tools": disallowed_tools,
+                        "auth_type": auth_type,
                         "secret_keys": list(secrets.keys())})
         return Response({
             "enrolled": True, "client_id": cid, "server_name": server_name,
-            "package": package, "env_keys": list(env_vars.keys()),
+            "package": package, "transport": transport, "url": url,
+            "allowed_tools": allowed_tools, "disallowed_tools": disallowed_tools,
+            "auth_type": auth_type,
+            "env_keys": list(env_vars.keys()),
             "secret_keys": list(secrets.keys()),
         }, status=201)
 
+    def delete(self, request, user_id, server_name):
+        ctx = di.get_context()
+        _, client_mcp_store = _client_stores(ctx)
+        cid = f"user:{user_id}"
+        if not client_mcp_store.delete(cid, server_name):
+            return Response({"detail": f"User MCP '{server_name}' not found"}, status=404)
+        _refresh_client_mcp_cache(ctx, client_mcp_store, cid)
+        _audit("user_mcp.delete", resource_type="user_mcp", resource_id=cid,
+               details={"server": server_name})
+        return Response({"deleted": True, "client_id": cid, "server_name": server_name})
+
 
 class NamespaceMcpView(APIView):
-    """POST /api/namespaces/{ns}/mcp/{server_name} — register an MCP for a namespace."""
+    """POST/DELETE /api/namespaces/{ns}/mcp/{server_name} — per-namespace MCP CRUD."""
 
     def post(self, request, ns, server_name):
         ctx = di.get_context()
@@ -433,9 +616,12 @@ class NamespaceMcpView(APIView):
                 status=403)
         client_store, client_mcp_store = _client_stores(ctx)
         body = request.data if isinstance(request.data, dict) else {}
-        package = (body.get("package") or "").strip()
-        if not package:
-            return Response({"detail": "`package` is required"}, status=400)
+        parsed = _parse_mcp_transport(body)
+        if isinstance(parsed, Response):
+            return parsed
+        package, transport, url = parsed
+        allowed_tools, disallowed_tools = _parse_tool_filters(body)
+        auth_type, auth_config = _parse_auth(body)
         env_vars = dict(body.get("env_vars") or {})
         secrets = dict(body.get("secrets") or {})
         args = body.get("args") or []
@@ -467,22 +653,115 @@ class NamespaceMcpView(APIView):
                 env_vars[key] = f"secret:{logical}"
 
         try:
-            client_mcp_store.add(cid, server_name, package, env_vars, args)
+            client_mcp_store.add(
+                cid, server_name, package, env_vars, args,
+                transport=transport, url=url,
+                allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+                auth_type=auth_type, auth_config=auth_config,
+            )
         except ValueError:
-            client_mcp_store.update(cid, server_name, package, env_vars, args)
+            client_mcp_store.update(
+                cid, server_name, package, env_vars, args,
+                transport=transport, url=url,
+                allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+                auth_type=auth_type, auth_config=auth_config,
+            )
         _refresh_client_mcp_cache(ctx, client_mcp_store, cid)
         _audit("namespace_mcp.enroll", actor=caller, resource_type="namespace_mcp",
                resource_id=cid,
                details={"namespace": ns, "server": server_name, "package": package,
+                        "transport": transport, "url": url,
+                        "allowed_tools": allowed_tools,
+                        "disallowed_tools": disallowed_tools,
+                        "auth_type": auth_type,
                         "secret_keys": list(secrets.keys())})
         return Response({
             "enrolled": True, "client_id": cid, "namespace": ns, "server_name": server_name,
-            "package": package, "env_keys": list(env_vars.keys()),
+            "package": package, "transport": transport, "url": url,
+            "allowed_tools": allowed_tools, "disallowed_tools": disallowed_tools,
+            "auth_type": auth_type,
+            "env_keys": list(env_vars.keys()),
             "secret_keys": list(secrets.keys()),
         }, status=201)
+
+    def delete(self, request, ns, server_name):
+        ctx = di.get_context()
+        if not _can_write_secret(request, ctx, "namespace", ns):
+            return Response(
+                {"detail": f"not authorized to manage namespace '{ns}' MCP credentials"},
+                status=403)
+        _, client_mcp_store = _client_stores(ctx)
+        cid = f"ns:{ns}"
+        if not client_mcp_store.delete(cid, server_name):
+            return Response({"detail": f"Namespace MCP '{server_name}' not found"}, status=404)
+        _refresh_client_mcp_cache(ctx, client_mcp_store, cid)
+        _audit("namespace_mcp.delete", resource_type="namespace_mcp", resource_id=cid,
+               details={"namespace": ns, "server": server_name})
+        return Response({"deleted": True, "client_id": cid, "namespace": ns,
+                         "server_name": server_name})
 
 
 def _remote_host(request) -> str:
     """Best-effort client host for audit/caller attribution (FastAPI's
     request.client.host fallback)."""
     return request.META.get("REMOTE_ADDR") or "api"
+
+
+# ---------------------------------------------------------------------------
+# MCP access groups (migration 024) — named, reusable bundles of server-names
+# an agent can be scoped to via metadata.mcp_access_group. Django-native
+# additions (recorded in tests/contract test_route_parity._DJANGO_NATIVE_ADDITIONS).
+# ---------------------------------------------------------------------------
+
+def _access_group_store(ctx):
+    from src.platform.client_store import PostgresMcpAccessGroupStore
+    return PostgresMcpAccessGroupStore(db_client=ctx.db_client, tenant_id=ctx.tenant_id)
+
+
+class McpAccessGroupSerializer(serializers.Serializer):
+    name = serializers.CharField(min_length=1, max_length=200)
+    server_names = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list,
+    )
+
+
+class McpAccessGroupsView(APIView):
+    """GET/POST /api/mcp/access-groups — list / create-or-update access groups.
+
+    Managing groups is a governance action, so writes require the admin role
+    (reads are open to any authenticated caller so operators can pick a group).
+    """
+
+    def get(self, request):
+        ctx = di.get_context()
+        return Response(_access_group_store(ctx).list_groups())
+
+    def post(self, request):
+        ctx = di.get_context()
+        _, role = _acting_principal(request, ctx)
+        if ctx.auth_enabled and role != ADMIN_ROLE:
+            return Response(
+                {"detail": "only admins may manage MCP access groups"}, status=403)
+        ser = McpAccessGroupSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        req = ser.validated_data
+        out = _access_group_store(ctx).upsert(req["name"], req["server_names"])
+        _audit("mcp_access_group.upsert", resource_type="mcp_access_group",
+               resource_id=req["name"], details={"server_names": req["server_names"]})
+        return Response(out, status=201)
+
+
+class McpAccessGroupDetailView(APIView):
+    """DELETE /api/mcp/access-groups/{name}."""
+
+    def delete(self, request, name):
+        ctx = di.get_context()
+        _, role = _acting_principal(request, ctx)
+        if ctx.auth_enabled and role != ADMIN_ROLE:
+            return Response(
+                {"detail": "only admins may manage MCP access groups"}, status=403)
+        if not _access_group_store(ctx).delete(name):
+            return Response({"detail": f"access group '{name}' not found"}, status=404)
+        _audit("mcp_access_group.delete", resource_type="mcp_access_group",
+               resource_id=name)
+        return Response({"deleted": True, "name": name})

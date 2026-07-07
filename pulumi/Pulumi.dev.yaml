@@ -16,7 +16,10 @@ config:
   # Image tags resolved by CI on push to main (see .github/workflows).
   forgeos-gcp:platform_api_tag: "latest"
   forgeos-gcp:migrations_tag: "latest"
-  forgeos-gcp:dashboard_tag: "latest"
+  # Pinned to a specific build (not "latest") so pulumi up can't revert the
+  # dashboard to an image lacking the NEXT_PUBLIC_GCP_PROJECT_ID build-arg
+  # (which the wizard's SA-provisioning flow needs). Bump on new dashboard builds.
+  forgeos-gcp:dashboard_tag: "e67621f"
   # Full Drive scope so per-agent SAs (treasury demo) can read/write folders
   # SHARED with their email; default drive.file only sees app-created files.
   forgeos-gcp:drive_scopes: drive
@@ -30,3 +33,5 @@ config:
   # `pulumi config set --secret forgeos-gcp:<key>` on the KMS-backed stack.
   forgeos-gcp:deletion_protection: "false"
   forgeos-gcp:environment: "dev"
+secretsprovider: gcpkms://projects/ms-tool-sys/locations/europe-west1/keyRings/helios-pulumi/cryptoKeys/pulumi-secrets
+encryptedkey: CiQAQBwV5yMV5ugrCU9rimjcdlVdT+qa6NeEhsbrxokJRhuqZcESSQD1UoIGJBn5f0smO8/am6X//C/uTh+J15X9JbdsZpkE/pO7J+885AO4d8JD50nk5QzfGtdH4qUax8y92qRVoRnpk8GEeuI+oYY=
